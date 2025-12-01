@@ -2,6 +2,7 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
+import math
 import time
 from typing import Callable, List, Optional, Sequence, Tuple, cast
 
@@ -86,8 +87,8 @@ class CEMOptimizer(Optimizer):
         self.num_iterations = num_iterations
         self.elite_ratio = elite_ratio
         self.population_size = population_size
-        self.elite_num = np.ceil(self.population_size * self.elite_ratio).astype(
-            np.int32
+        self.elite_num = max(
+            1, np.ceil(self.population_size * self.elite_ratio).astype(np.int32)
         )
         self.lower_bound = torch.tensor(lower_bound, device=device, dtype=torch.float32)
         self.upper_bound = torch.tensor(upper_bound, device=device, dtype=torch.float32)
@@ -186,6 +187,276 @@ class CEMOptimizer(Optimizer):
                 best_solution = population[elite_idx[0]].clone()
 
         return mu if self.return_mean_elites else best_solution
+
+class DecentCEMOptimizer(Optimizer):
+    """Runs multiple independent CEM optimizers in parallel and picks the best result."""
+
+    def __init__(
+        self,
+        num_iterations: int,
+        elite_ratio: float,
+        population_size: int,
+        lower_bound: Sequence[Sequence[float]],
+        upper_bound: Sequence[Sequence[float]],
+        alpha: float,
+        device: torch.device,
+        num_workers: int = 4,
+        return_mean_elites: bool = False,
+        clipped_normal: bool = False,
+    ):
+        super().__init__()
+        self.num_iterations = num_iterations
+        self.elite_ratio = elite_ratio
+        self.population_size = population_size
+        self.elite_num = np.ceil(self.population_size * self.elite_ratio).astype(
+            np.int32
+        )
+        self.lower_bound = torch.tensor(lower_bound, device=device, dtype=torch.float32)
+        self.upper_bound = torch.tensor(upper_bound, device=device, dtype=torch.float32)
+        self.alpha = alpha
+        self.return_mean_elites = return_mean_elites
+        self.device = device
+        self.num_workers = num_workers
+        self._clipped_normal = clipped_normal
+
+    def _init_population_params(
+        self, x0: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mean = x0.expand((self.num_workers,) + x0.shape)
+        if self._clipped_normal:
+            dispersion = torch.ones_like(mean)
+        else:
+            base_var = ((self.upper_bound - self.lower_bound) ** 2) / 16
+            dispersion = base_var.expand_as(mean)
+        return mean, dispersion
+
+    def _sample_population(
+        self, mean: torch.Tensor, dispersion: torch.Tensor, population: torch.Tensor
+    ) -> torch.Tensor:
+        if self._clipped_normal:
+            pop = mean.unsqueeze(1) + dispersion.unsqueeze(1) * torch.randn_like(
+                population
+            )
+            return torch.max(torch.min(pop, self.upper_bound), self.lower_bound)
+
+        lb_dist = mean - self.lower_bound
+        ub_dist = self.upper_bound - mean
+        mv = torch.min(torch.square(lb_dist / 2), torch.square(ub_dist / 2))
+        constrained_var = torch.min(mv, dispersion)
+
+        population = mbrl.util.math.truncated_normal_(population)
+        scaled_noise = population * torch.sqrt(constrained_var).unsqueeze(1)
+        return scaled_noise + mean.unsqueeze(1)
+
+    def _update_population_params(
+        self, elite: torch.Tensor, mu: torch.Tensor, dispersion: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        new_mu = torch.mean(elite, dim=1)
+        if self._clipped_normal:
+            new_dispersion = torch.std(elite, dim=1, unbiased=False)
+        else:
+            new_dispersion = torch.var(elite, dim=1, unbiased=False)
+        mu = self.alpha * mu + (1 - self.alpha) * new_mu
+        dispersion = self.alpha * dispersion + (1 - self.alpha) * new_dispersion
+        return mu, dispersion
+
+    def optimize(
+        self,
+        obj_fun: Callable[[torch.Tensor], torch.Tensor],
+        x0: Optional[torch.Tensor] = None,
+        callback: Optional[Callable[[torch.Tensor, torch.Tensor, int], None]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        mu, dispersion = self._init_population_params(x0)
+        best_solution = torch.empty_like(x0)
+        best_value = -np.inf
+        best_worker_idx = 0
+        population = torch.zeros(
+            (self.num_workers, self.population_size) + x0.shape, device=self.device
+        )
+        for i in range(self.num_iterations):
+            population = self._sample_population(mu, dispersion, population)
+            flat_population = population.reshape(-1, *x0.shape)
+            values = obj_fun(flat_population).reshape(
+                self.num_workers, self.population_size
+            )
+            values[values.isnan()] = -1e-10
+
+            if callback is not None:
+                callback(flat_population, values.reshape(-1), i)
+
+            best_values, elite_idx = values.topk(self.elite_num, dim=1)
+            worker_indices = torch.arange(self.num_workers, device=self.device).view(
+                -1, 1
+            )
+            elite = population[worker_indices, elite_idx]
+
+            mu, dispersion = self._update_population_params(elite, mu, dispersion)
+
+            worker_best_values = best_values[:, 0]
+            candidate_value, candidate_worker = torch.max(worker_best_values, dim=0)
+            candidate_value_item = float(candidate_value)
+            if candidate_value_item > best_value:
+                best_value = candidate_value_item
+                best_worker_idx = int(candidate_worker)
+                best_solution = population[
+                    best_worker_idx, elite_idx[best_worker_idx, 0]
+                ].clone()
+
+        if self.return_mean_elites:
+            return mu[best_worker_idx]
+        return best_solution
+
+
+class GMMCEMOptimizer(Optimizer):
+    """Runs a Gaussian Mixture Model variant of CEM."""
+
+    def __init__(
+        self,
+        num_iterations: int,
+        elite_ratio: float,
+        population_size: int,
+        lower_bound: Sequence[Sequence[float]],
+        upper_bound: Sequence[Sequence[float]],
+        alpha: float,
+        device: torch.device,
+        num_workers: int = 4,
+        return_mean_elites: bool = False,
+        clipped_normal: bool = False,
+    ):
+        super().__init__()
+        self.num_iterations = num_iterations
+        self.elite_ratio = elite_ratio
+        self.population_size = population_size
+        self.elite_num = np.ceil(self.population_size * self.elite_ratio).astype(
+            np.int32
+        )
+        self.lower_bound = torch.tensor(lower_bound, device=device, dtype=torch.float32)
+        self.upper_bound = torch.tensor(upper_bound, device=device, dtype=torch.float32)
+        self.alpha = alpha
+        self.return_mean_elites = return_mean_elites
+        self.device = device
+        self.num_workers = num_workers
+        self._clipped_normal = clipped_normal
+        self._eps = 1e-8
+
+    def _init_population_params(
+        self, x0: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean = x0.expand((self.num_workers,) + x0.shape).clone()
+        if self._clipped_normal:
+            dispersion = torch.ones_like(mean)
+        else:
+            base_var = ((self.upper_bound - self.lower_bound) ** 2) / 16
+            dispersion = base_var.expand_as(mean)
+        mix = torch.full(
+            (self.num_workers,), 1.0 / self.num_workers, device=self.device
+        )
+        return mean, dispersion, mix
+
+    def _sample_population(
+        self,
+        mean: torch.Tensor,
+        dispersion: torch.Tensor,
+        population: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._clipped_normal:
+            pop = mean.unsqueeze(1) + dispersion.unsqueeze(1) * torch.randn_like(
+                population
+            )
+            return torch.max(torch.min(pop, self.upper_bound), self.lower_bound)
+
+        lb_dist = mean - self.lower_bound
+        ub_dist = self.upper_bound - mean
+        mv = torch.min(torch.square(lb_dist / 2), torch.square(ub_dist / 2))
+        constrained_var = torch.min(mv, dispersion)
+
+        population = mbrl.util.math.truncated_normal_(population)
+        scaled_noise = population * torch.sqrt(constrained_var).unsqueeze(1)
+        return scaled_noise + mean.unsqueeze(1)
+
+    def _log_prob(
+        self, flat_population: torch.Tensor, mean: torch.Tensor, dispersion: torch.Tensor
+    ) -> torch.Tensor:
+        # flat_population: (S, H, A); mean/dispersion: (K, H, A)
+        diff = flat_population.unsqueeze(0) - mean.unsqueeze(1)
+        var = dispersion.unsqueeze(1)
+        log_var = torch.log(var + self._eps)
+        quad_term = (diff * diff) / (var + self._eps)
+        reduce_dims = tuple(range(2, diff.dim()))
+        dim = flat_population[0].numel()
+        return -0.5 * (
+            log_var.sum(dim=reduce_dims)
+            + quad_term.sum(dim=reduce_dims)
+            + dim * math.log(2 * math.pi)
+        )
+
+    def optimize(
+        self,
+        obj_fun: Callable[[torch.Tensor], torch.Tensor],
+        x0: Optional[torch.Tensor] = None,
+        callback: Optional[Callable[[torch.Tensor, torch.Tensor, int], None]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        mu, dispersion, mix = self._init_population_params(x0)
+        best_solution = torch.empty_like(x0)
+        best_value = -np.inf
+        best_worker = 0
+        population = torch.zeros(
+            (self.num_workers, self.population_size) + x0.shape, device=self.device
+        )
+
+        for i in range(self.num_iterations):
+            population = self._sample_population(mu, dispersion, population)
+            flat_population = population.reshape(-1, *x0.shape)
+            values = obj_fun(flat_population).reshape(
+                self.num_workers, self.population_size
+            )
+            values[values.isnan()] = -1e-10
+
+            if callback is not None:
+                callback(flat_population, values.reshape(-1), i)
+
+            values_flat = values.reshape(-1)
+            candidate_value, candidate_idx = torch.max(values_flat, dim=0)
+            candidate_value_item = float(candidate_value)
+            if candidate_value_item > best_value:
+                best_value = candidate_value_item
+                best_solution = flat_population[candidate_idx].clone()
+                best_worker = int(candidate_idx) // self.population_size
+
+            value_weights = torch.softmax(values_flat, dim=0)
+            log_prob = self._log_prob(flat_population, mu, dispersion)
+            log_mix = torch.log(mix + self._eps).unsqueeze(1)
+            log_joint = log_mix + log_prob
+            log_norm = torch.logsumexp(log_joint, dim=0, keepdim=True)
+            responsibilities = torch.exp(log_joint - log_norm)
+
+            weighted_resp = responsibilities * value_weights.unsqueeze(0)
+            comp_weight = weighted_resp.sum(dim=1) + self._eps
+
+            weighted_resp_exp = weighted_resp.unsqueeze(-1)
+            flat_expanded = flat_population.unsqueeze(0)
+            new_mu = (weighted_resp_exp * flat_expanded).sum(dim=1) / (
+                comp_weight.unsqueeze(-1)
+            )
+            diff = flat_expanded - new_mu.unsqueeze(1)
+            new_dispersion = (
+                weighted_resp_exp * diff * diff
+            ).sum(dim=1) / comp_weight.unsqueeze(-1)
+
+            mu = self.alpha * mu + (1 - self.alpha) * new_mu
+            dispersion = self.alpha * dispersion + (1 - self.alpha) * new_dispersion
+            mix_update = comp_weight / (comp_weight.sum() + self._eps)
+            mix = self.alpha * mix + (1 - self.alpha) * mix_update
+            mix = mix / (mix.sum() + self._eps)
+
+            mu = torch.clamp(mu, min=self.lower_bound, max=self.upper_bound)
+            dispersion = torch.clamp(dispersion, min=self._eps)
+
+        if self.return_mean_elites:
+            return mu[best_worker]
+        return best_solution
 
 
 class MPPIOptimizer(Optimizer):
