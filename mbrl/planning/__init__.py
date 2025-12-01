@@ -6,6 +6,8 @@ from .core import Agent, RandomAgent, complete_agent_cfg, load_agent
 from .linear_feedback import PIDAgent
 from .trajectory_opt import (
     CEMOptimizer,
+    DecentCEMOptimizer,
+    GMMCEMOptimizer,
     ICEMOptimizer,
     MPPIOptimizer,
     TrajectoryOptimizer,

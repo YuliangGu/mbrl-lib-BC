@@ -76,7 +76,7 @@ if __name__ == "__main__":
     parser.add_argument("--samples_per_process", type=int, default=512)
     parser.add_argument("--render", action="store_true")
     parser.add_argument(
-        "--optimizer_type", choices=["cem", "icem", "mppi"], default="cem"
+        "--optimizer_type", choices=["cem", "decent_cem", "icem", "mppi"], default="cem"
     )
     parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
@@ -97,6 +97,20 @@ if __name__ == "__main__":
                 "elite_ratio": 0.1,
                 "population_size": args.num_processes * args.samples_per_process,
                 "alpha": 0.1,
+                "lower_bound": "???",
+                "upper_bound": "???",
+            }
+        )
+    elif args.optimizer_type == "decent_cem":
+        optimizer_cfg = omegaconf.OmegaConf.create(
+            {
+                "_target_": "mbrl.planning.DecentCEMOptimizer",
+                "device": "cpu",
+                "num_iterations": 5,
+                "elite_ratio": 0.1,
+                "population_size": args.num_processes * args.samples_per_process,
+                "alpha": 0.1,
+                "num_workers": args.num_processes,
                 "lower_bound": "???",
                 "upper_bound": "???",
             }
