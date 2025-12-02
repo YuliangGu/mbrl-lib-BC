@@ -1,0 +1,12 @@
+# @package _group_
+
+_target_: mbrl.planning.CMAESOptimizer
+num_iterations: ${overrides.cma_num_iters}
+population_size: ${overrides.cma_population_size}
+elite_ratio: ${overrides.cma_elite_ratio}
+sigma: ${overrides.cma_sigma}
+lower_bound: ???
+upper_bound: ???
+alpha: ${overrides.cma_alpha}
+device: ${device}
+return_mean_elites: true

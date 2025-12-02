@@ -434,15 +434,20 @@ class GMMCEMOptimizer(Optimizer):
             weighted_resp = responsibilities * value_weights.unsqueeze(0)
             comp_weight = weighted_resp.sum(dim=1) + self._eps
 
-            weighted_resp_exp = weighted_resp.unsqueeze(-1)
-            flat_expanded = flat_population.unsqueeze(0)
-            new_mu = (weighted_resp_exp * flat_expanded).sum(dim=1) / (
-                comp_weight.unsqueeze(-1)
+            sample_dims = flat_population.dim() - 1
+            weight_shape = (self.num_workers, flat_population.shape[0]) + (
+                (1,) * sample_dims
             )
+            weighted_resp_exp = weighted_resp.reshape(weight_shape)
+            flat_expanded = flat_population.unsqueeze(0)
+            comp_weight_exp = comp_weight.reshape(
+                (self.num_workers,) + (1,) * sample_dims
+            )
+            new_mu = (weighted_resp_exp * flat_expanded).sum(dim=1) / comp_weight_exp
             diff = flat_expanded - new_mu.unsqueeze(1)
             new_dispersion = (
                 weighted_resp_exp * diff * diff
-            ).sum(dim=1) / comp_weight.unsqueeze(-1)
+            ).sum(dim=1) / comp_weight_exp
 
             mu = self.alpha * mu + (1 - self.alpha) * new_mu
             dispersion = self.alpha * dispersion + (1 - self.alpha) * new_dispersion
@@ -455,6 +460,144 @@ class GMMCEMOptimizer(Optimizer):
 
         if self.return_mean_elites:
             return mu[best_worker]
+        return best_solution
+
+
+class NESOptimizer(Optimizer):
+    """Implements a Natural Evolution Strategy (NES) optimizer.
+
+    This implementation uses a diagonal Gaussian search distribution and natural-gradient
+    style updates for both the mean and the (log) standard deviation of the distribution.
+
+    Args:
+        num_iterations (int): number of optimization iterations.
+        population_size (int): number of sampled candidates per iteration.
+        sigma (float): initial standard deviation for sampling.
+        lr_mean (float): learning rate for mean updates.
+        lr_sigma (float): learning rate for standard deviation updates.
+        lower_bound (sequence of floats): lower bounds for the variables.
+        upper_bound (sequence of floats): upper bounds for the variables.
+        device (torch.device): computation device.
+        return_mean_elites (bool): if ``True`` returns the final mean instead of best sample.
+        min_sigma (float): minimum standard deviation allowed during optimization.
+        max_sigma (float, optional): maximum standard deviation allowed. Defaults to ``None``.
+    """
+
+    def __init__(
+        self,
+        num_iterations: int,
+        population_size: int,
+        sigma: float,
+        lr_mean: float,
+        lr_sigma: float,
+        lower_bound: Sequence[Sequence[float]],
+        upper_bound: Sequence[Sequence[float]],
+        device: torch.device,
+        return_mean_elites: bool = False,
+        min_sigma: float = 1e-3,
+        max_sigma: Optional[float] = None,
+    ):
+        super().__init__()
+        self.num_iterations = num_iterations
+        self.population_size = population_size
+        self.sigma = sigma
+        self.lr_mean = lr_mean
+        self.lr_sigma = lr_sigma
+        self.return_mean_elites = return_mean_elites
+        self.device = device
+        self.min_sigma = min_sigma
+        self.max_sigma = max_sigma
+        self.lower_bound = torch.tensor(lower_bound, device=device, dtype=torch.float32)
+        self.upper_bound = torch.tensor(upper_bound, device=device, dtype=torch.float32)
+        self._eps = 1e-8
+
+    def optimize(
+        self,
+        obj_fun: Callable[[torch.Tensor], torch.Tensor],
+        x0: Optional[torch.Tensor] = None,
+        callback: Optional[Callable[[torch.Tensor, torch.Tensor, int], None]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Runs a diagonal NES optimization loop."""
+        if x0 is None:
+            raise ValueError("NESOptimizer requires an initial solution x0.")
+
+        mu = x0.reshape(-1).to(self.device)
+        dim = mu.shape[0]
+        log_sigma = torch.full_like(mu, math.log(self.sigma))
+
+        flat_lb = self.lower_bound.reshape(-1)
+        flat_ub = self.upper_bound.reshape(-1)
+
+        best_solution = x0.clone()
+        best_value = -np.inf
+
+        for i in range(self.num_iterations):
+            sigma_vec = torch.exp(log_sigma)
+            half = self.population_size // 2
+            noise_half = torch.randn((half, dim), device=self.device)
+            noise = (
+                torch.cat([noise_half, -noise_half], dim=0)
+                if self.population_size % 2 == 0
+                else torch.cat(
+                    [noise_half, -noise_half, torch.randn((1, dim), device=self.device)],
+                    dim=0,
+                )
+            )
+            candidates = mu.unsqueeze(0) + sigma_vec.unsqueeze(0) * noise
+            candidates = torch.clamp(candidates, min=flat_lb, max=flat_ub)
+            population = candidates.view(self.population_size, *x0.shape)
+
+            values = obj_fun(population)
+            values[values.isnan()] = -1e-10
+
+            if callback is not None:
+                callback(population, values, i)
+
+            values_flat = values.reshape(-1)
+            candidate_idx = int(torch.argmax(values_flat))
+            candidate_value = float(values_flat[candidate_idx])
+            if candidate_value > best_value:
+                best_value = candidate_value
+                best_solution = population.view(-1, *x0.shape)[candidate_idx].clone()
+            best_candidate = candidates[candidate_idx]
+
+            n = values_flat.numel()
+            if n <= 1:
+                continue
+            weights = torch.softmax(values_flat - values_flat.max(), dim=0)
+            centered = weights - weights.mean()
+            std = centered.std(unbiased=False)
+            if std < self._eps:
+                continue
+            weights = centered / (std + self._eps)
+
+            perturbation = candidates - mu.unsqueeze(0)
+            scaled = perturbation / (sigma_vec.unsqueeze(0) + self._eps)
+
+            grad_mu = (weights.unsqueeze(1) * scaled).mean(dim=0)
+            grad_log_sigma = (
+                weights.unsqueeze(1) * (scaled * scaled - 1.0)
+            ).mean(dim=0)
+
+            mu = mu + self.lr_mean * sigma_vec * grad_mu
+            log_sigma = log_sigma + 0.5 * self.lr_sigma * grad_log_sigma
+            mu = mu + 0.2 * (best_candidate - mu)
+
+            mu = torch.clamp(mu, min=flat_lb, max=flat_ub)
+            if self.max_sigma is not None:
+                log_sigma = torch.clamp(
+                    log_sigma,
+                    min=math.log(self.min_sigma),
+                    max=math.log(self.max_sigma),
+                )
+            else:
+                log_sigma = torch.maximum(
+                    log_sigma, torch.full_like(log_sigma, math.log(self.min_sigma))
+                )
+
+        if self.return_mean_elites:
+            return mu.view_as(x0)
         return best_solution
 
 

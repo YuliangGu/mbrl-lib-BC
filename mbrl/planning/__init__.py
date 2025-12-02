@@ -9,6 +9,8 @@ from .trajectory_opt import (
     DecentCEMOptimizer,
     GMMCEMOptimizer,
     ICEMOptimizer,
+    NESOptimizer,
+    CMAESOptimizer,
     MPPIOptimizer,
     TrajectoryOptimizer,
     TrajectoryOptimizerAgent,
