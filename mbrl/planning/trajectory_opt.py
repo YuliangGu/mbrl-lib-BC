@@ -18,7 +18,6 @@ import mbrl.util.math
 
 from .core import Agent, complete_agent_cfg
 
-
 class Optimizer:
     def __init__(self):
         pass
@@ -456,6 +455,127 @@ class GMMCEMOptimizer(Optimizer):
 
         if self.return_mean_elites:
             return mu[best_worker]
+        return best_solution
+
+
+class CMAESOptimizer(Optimizer):
+    """Implements a CMA-ES style optimizer with configurable covariance adaptation.
+
+    Args:
+        num_iterations (int): number of optimization iterations.
+        population_size (int): number of sampled candidates per iteration.
+        elite_ratio (float): fraction of top samples to use for updates.
+        sigma (float): initial standard deviation for sampling.
+        lower_bound (sequence of floats): lower bounds for the variables.
+        upper_bound (sequence of floats): upper bounds for the variables.
+        alpha (float): smoothing factor for updates.
+        adaptation (str): either ``diagonal`` or ``full`` covariance adaptation.
+        device (torch.device): computation device.
+        return_mean_elites (bool): if ``True`` returns the final mean instead of best sample.
+    """
+
+    def __init__(
+        self,
+        num_iterations: int,
+        population_size: int,
+        elite_ratio: float,
+        sigma: float,
+        lower_bound: Sequence[Sequence[float]],
+        upper_bound: Sequence[Sequence[float]],
+        alpha: float,
+        device: torch.device,
+        adaptation: str = "diagonal",
+        return_mean_elites: bool = False,
+    ):
+        super().__init__()
+        self.num_iterations = num_iterations
+        self.population_size = population_size
+        self.elite_num = max(1, int(math.ceil(population_size * elite_ratio)))
+        self.sigma = sigma
+        self.alpha = alpha
+        self.return_mean_elites = return_mean_elites
+        self.device = device
+        self.adaptation = adaptation.lower()
+        if self.adaptation not in ("diagonal", "full"):
+            raise ValueError("adaptation must be either 'diagonal' or 'full'.")
+        self.lower_bound = torch.tensor(lower_bound, device=device, dtype=torch.float32)
+        self.upper_bound = torch.tensor(upper_bound, device=device, dtype=torch.float32)
+        self._eps = 1e-8
+
+    def optimize(
+        self,
+        obj_fun: Callable[[torch.Tensor], torch.Tensor],
+        x0: Optional[torch.Tensor] = None,
+        callback: Optional[Callable[[torch.Tensor, torch.Tensor, int], None]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Runs a diagonal CMA-ES loop."""
+        if x0 is None:
+            raise ValueError("CMAESOptimizer requires an initial solution x0.")
+
+        flat_lb = self.lower_bound.reshape(-1)
+        flat_ub = self.upper_bound.reshape(-1)
+        mean = x0.reshape(-1).to(self.device)
+        dim = mean.shape[0]
+        eye = torch.eye(dim, device=self.device, dtype=torch.float32)
+        if self.adaptation == "full":
+            cov = eye * (self.sigma**2)
+        else:
+            var = torch.full(
+                (dim,), self.sigma**2, device=self.device, dtype=torch.float32
+            )
+
+        best_solution = x0.clone()
+        best_value = -np.inf
+
+        for i in range(self.num_iterations):
+            noise = torch.randn((self.population_size, dim), device=self.device)
+            if self.adaptation == "full":
+                chol = torch.linalg.cholesky(cov + self._eps * eye)
+                candidates = mean.unsqueeze(0) + noise @ chol.T
+            else:
+                candidates = mean.unsqueeze(0) + noise * torch.sqrt(var).unsqueeze(0)
+            candidates = torch.clamp(candidates, min=flat_lb, max=flat_ub)
+            population = candidates.view(self.population_size, *x0.shape)
+
+            values = obj_fun(population)
+            values[values.isnan()] = -1e-10
+
+            if callback is not None:
+                callback(population, values, i)
+
+            top_values, elite_idx = values.topk(self.elite_num)
+            elite = candidates[elite_idx]
+
+            raw_weights = torch.log(
+                torch.arange(1, self.elite_num + 1, device=self.device).float() + 0.5
+            )
+            weights = raw_weights / (raw_weights.sum() + self._eps)
+
+            new_mean = (weights.unsqueeze(1) * elite).sum(dim=0)
+            diff = elite - new_mean.unsqueeze(0)
+            if self.adaptation == "full":
+                weighted = weights.unsqueeze(1) * diff
+                new_cov = weighted.T @ diff
+                cov = self.alpha * cov + (1 - self.alpha) * new_cov
+            else:
+                new_var = (weights.unsqueeze(1) * (diff * diff)).sum(dim=0)
+                var = self.alpha * var + (1 - self.alpha) * new_var
+
+            mean = self.alpha * mean + (1 - self.alpha) * new_mean
+
+            mean = torch.clamp(mean, min=flat_lb, max=flat_ub)
+            if self.adaptation == "full":
+                cov = 0.5 * (cov + cov.T) + self._eps * eye
+            else:
+                var = torch.clamp(var, min=self._eps)
+
+            if top_values[0] > best_value:
+                best_value = float(top_values[0])
+                best_solution = population[elite_idx[0]].clone()
+
+        if self.return_mean_elites:
+            return mean.view_as(x0)
         return best_solution
 
 
