@@ -18,6 +18,8 @@ import mbrl.util.math
 
 from .core import Agent, complete_agent_cfg
 
+DISPERSION_EPS = 1e-3
+
 class Optimizer:
     def __init__(self):
         pass
@@ -137,6 +139,7 @@ class CEMOptimizer(Optimizer):
             new_dispersion = torch.var(elite, dim=0)
         mu = self.alpha * mu + (1 - self.alpha) * new_mu
         dispersion = self.alpha * dispersion + (1 - self.alpha) * new_dispersion
+        dispersion = torch.clamp(dispersion, min=DISPERSION_EPS)
         return mu, dispersion
 
     def optimize(
@@ -202,6 +205,7 @@ class DecentCEMOptimizer(Optimizer):
         num_workers: int = 4,
         return_mean_elites: bool = False,
         clipped_normal: bool = False,
+        init_jitter_scale: float = 0.0,
     ):
         super().__init__()
         self.num_iterations = num_iterations
@@ -217,6 +221,8 @@ class DecentCEMOptimizer(Optimizer):
         self.device = device
         self.num_workers = num_workers
         self._clipped_normal = clipped_normal
+        self._eps = 1e-8
+        self.init_jitter_scale = init_jitter_scale
 
     def _init_population_params(
         self, x0: torch.Tensor
@@ -227,6 +233,15 @@ class DecentCEMOptimizer(Optimizer):
         else:
             base_var = ((self.upper_bound - self.lower_bound) ** 2) / 16
             dispersion = base_var.expand_as(mean)
+        if self.init_jitter_scale > 0:
+            mean = torch.clamp(
+                mean
+                + self.init_jitter_scale
+                * torch.randn_like(mean)
+                * torch.sqrt(dispersion + self._eps),
+                min=self.lower_bound,
+                max=self.upper_bound,
+            )
         return mean, dispersion
 
     def _sample_population(
@@ -257,6 +272,7 @@ class DecentCEMOptimizer(Optimizer):
             new_dispersion = torch.var(elite, dim=1, unbiased=False)
         mu = self.alpha * mu + (1 - self.alpha) * new_mu
         dispersion = self.alpha * dispersion + (1 - self.alpha) * new_dispersion
+        dispersion = torch.clamp(dispersion, min=DISPERSION_EPS)
         return mu, dispersion
 
     def optimize(
@@ -306,9 +322,90 @@ class DecentCEMOptimizer(Optimizer):
             return mu[best_worker_idx]
         return best_solution
 
+class BCCEMOptimizer(DecentCEMOptimizer):
+    """ TESTING: Bregman(KL)-Centroid guided ensemble CEM method. """
+    
+    def optimize(
+        self,
+        obj_fun: Callable[[torch.Tensor], torch.Tensor],
+        x0: Optional[torch.Tensor] = None,
+        callback: Optional[
+            Callable[
+                [
+                    torch.Tensor,
+                    torch.Tensor,
+                    int,
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor,
+                ],
+                None,
+            ]
+        ] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        tau = kwargs.pop("tau", 1.0)    # higher tau -> more uniform weights
+        mu, dispersion = self._init_population_params(x0)
+        best_solution = torch.empty_like(x0)
+        best_value = -np.inf
+        best_worker_idx = 0
+        population = torch.zeros(
+            (self.num_workers, self.population_size) + x0.shape, device=self.device
+        )
+        for i in range(self.num_iterations):
+            population = self._sample_population(mu, dispersion, population)
+            flat_population = population.reshape(-1, *x0.shape)
+            values = obj_fun(flat_population).reshape(
+                self.num_workers, self.population_size
+            )
+            values[values.isnan()] = -1e-10
+
+            best_values, elite_idx = values.topk(self.elite_num, dim=1)
+            worker_indices = torch.arange(self.num_workers, device=self.device).view(
+                -1, 1
+            )
+            elite = population[worker_indices, elite_idx]
+
+            mu, dispersion = self._update_population_params(elite, mu, dispersion)
+
+            """ TESTING adds-on: no algorithmic change to original CEM """
+            # per-iteration worker quality: best value[:,0]
+            # rewards = best_values[:, 0] # shape: (num_workers, )
+            rewards = torch.mean(best_values, dim=1)  # shape: (num_workers, ) try average
+            logits = (rewards - rewards.max()) / tau  # tau: temperature parameter for softmax
+            w = torch.softmax(logits, dim=0)  # worker weights
+
+            mu_c = (w.view(-1, 1, 1) * mu).sum(dim=0)  # (H, A)
+
+            # simple variance proxy: use average dispersion as sigma^2
+            sigma2_c = (w.view(-1, 1, 1) * dispersion).sum(dim=0)  # (H, A)
+            sigma2_c = torch.clamp(sigma2_c, min=1e-3)  # avoid IR explosion
+
+            # gamma and IR
+            diff = (mu - mu_c) / torch.sqrt(sigma2_c) # boardcast to (K, H, A)
+            gamma = 0.5 * (diff * diff).sum(dim=(1,2))  # (K, ) | Bregman divergence
+            IR = (w * gamma).sum()  # Information Radius
+
+            if callback is not None:
+                sigma_c = torch.sqrt(sigma2_c)
+                callback(flat_population, values.reshape(-1), i, IR, mu_c, sigma_c)
+
+            worker_best_values = best_values[:, 0]
+            candidate_value, candidate_worker = torch.max(worker_best_values, dim=0)
+            candidate_value_item = float(candidate_value)
+            if candidate_value_item > best_value:
+                best_value = candidate_value_item
+                best_worker_idx = int(candidate_worker)
+                best_solution = population[
+                    best_worker_idx, elite_idx[best_worker_idx, 0]
+                ].clone()
+
+        if self.return_mean_elites:
+            return mu[best_worker_idx]
+        return best_solution   # Override optimize method
 
 class GMMCEMOptimizer(Optimizer):
-    """Runs a Gaussian Mixture Model variant of CEM."""
+    """Runs a Gaussian Mixture Model variant of CEM with optional initial mean jitter."""
 
     def __init__(
         self,
@@ -322,6 +419,7 @@ class GMMCEMOptimizer(Optimizer):
         num_workers: int = 4,
         return_mean_elites: bool = False,
         clipped_normal: bool = False,
+        init_jitter_scale: float = 0.0,
     ):
         super().__init__()
         self.num_iterations = num_iterations
@@ -338,6 +436,7 @@ class GMMCEMOptimizer(Optimizer):
         self.num_workers = num_workers
         self._clipped_normal = clipped_normal
         self._eps = 1e-8
+        self.init_jitter_scale = init_jitter_scale
 
     def _init_population_params(
         self, x0: torch.Tensor
@@ -348,6 +447,15 @@ class GMMCEMOptimizer(Optimizer):
         else:
             base_var = ((self.upper_bound - self.lower_bound) ** 2) / 16
             dispersion = base_var.expand_as(mean)
+        if self.init_jitter_scale > 0:
+            mean = torch.clamp(
+                mean
+                + self.init_jitter_scale
+                * torch.randn((self.num_workers,) + x0.shape, device=self.device)
+                * torch.sqrt(dispersion + self._eps),
+                min=self.lower_bound,
+                max=self.upper_bound,
+            )
         mix = torch.full(
             (self.num_workers,), 1.0 / self.num_workers, device=self.device
         )
@@ -369,6 +477,7 @@ class GMMCEMOptimizer(Optimizer):
         ub_dist = self.upper_bound - mean
         mv = torch.min(torch.square(lb_dist / 2), torch.square(ub_dist / 2))
         constrained_var = torch.min(mv, dispersion)
+        constrained_var = torch.clamp(constrained_var, min=DISPERSION_EPS)
 
         population = mbrl.util.math.truncated_normal_(population)
         scaled_noise = population * torch.sqrt(constrained_var).unsqueeze(1)
@@ -424,7 +533,7 @@ class GMMCEMOptimizer(Optimizer):
                 best_solution = flat_population[candidate_idx].clone()
                 best_worker = int(candidate_idx) // self.population_size
 
-            value_weights = torch.softmax(values_flat, dim=0)
+            value_weights = torch.softmax(values, dim=1).reshape(-1)
             log_prob = self._log_prob(flat_population, mu, dispersion)
             log_mix = torch.log(mix + self._eps).unsqueeze(1)
             log_joint = log_mix + log_prob
@@ -710,8 +819,10 @@ class CMAESOptimizer(Optimizer):
             mean = torch.clamp(mean, min=flat_lb, max=flat_ub)
             if self.adaptation == "full":
                 cov = 0.5 * (cov + cov.T) + self._eps * eye
+                cov = torch.clamp(cov, min=DISPERSION_EPS)
             else:
-                var = torch.clamp(var, min=self._eps)
+                var = torch.clamp(var, min=DISPERSION_EPS)
+                
 
             if top_values[0] > best_value:
                 best_value = float(top_values[0])
@@ -868,6 +979,8 @@ class ICEMOptimizer(Optimizer):
             iteration. Otherwise, it returns the max solution found over all iterations.
         population_size_module (int, optional): if specified, the population is rounded to be
             a multiple of this number. Defaults to ``None``.
+        init_jitter_scale (float): optional scale for adding initial noise to the mean to prevent
+            early collapse. Defaults to ``0.0``.
 
     [2] C. Pinneri, S. Sawant, S. Blaes, J. Achterhold, J. Stueckler, M. Rolinek and
     G, Martius, Georg. "Sample-efficient Cross-Entropy Method for Real-time Planning".
@@ -888,6 +1001,7 @@ class ICEMOptimizer(Optimizer):
         device: torch.device,
         return_mean_elites: bool = False,
         population_size_module: Optional[int] = None,
+        init_jitter_scale: float = 0.0,
     ):
         super().__init__()
         self.num_iterations = num_iterations
@@ -910,6 +1024,7 @@ class ICEMOptimizer(Optimizer):
         self.return_mean_elites = return_mean_elites
         self.population_size_module = population_size_module
         self.device = device
+        self.init_jitter_scale = init_jitter_scale
 
         if self.population_size_module:
             self.keep_elite_size = self._round_up_to_module(
@@ -945,6 +1060,15 @@ class ICEMOptimizer(Optimizer):
         """
         mu = x0.clone()
         var = self.initial_var.clone()
+        if self.init_jitter_scale > 0:
+            mu = torch.clamp(
+                mu
+                + self.init_jitter_scale
+                * torch.randn_like(mu)
+                * torch.sqrt(var).clamp_min(self._eps),
+                min=self.lower_bound,
+                max=self.upper_bound,
+            )
 
         best_solution = torch.empty_like(mu)
         best_value = -np.inf

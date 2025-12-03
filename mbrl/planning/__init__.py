@@ -7,6 +7,7 @@ from .linear_feedback import PIDAgent
 from .trajectory_opt import (
     CEMOptimizer,
     DecentCEMOptimizer,
+    BCCEMOptimizer,
     GMMCEMOptimizer,
     ICEMOptimizer,
     NESOptimizer,
