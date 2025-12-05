@@ -1,6 +1,6 @@
 # @package _group_
 
-_target_: mbrl.planning.GMMCEMOptimizer
+_target_: mbrl.planning.BCCEMOptimizer
 num_iterations: ${overrides.cem_num_iters}
 elite_ratio: ${overrides.cem_elite_ratio}
 population_size: ${overrides.cem_population_size}
@@ -11,4 +11,3 @@ upper_bound: ???
 return_mean_elites: true
 device: ${device}
 clipped_normal: ${overrides.cem_clipped_normal}
-min_component_weight: 0.01

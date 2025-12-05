@@ -1,0 +1,14 @@
+# @package _group_
+
+_target_: mbrl.planning.NESOptimizer
+num_iterations: ${overrides.nes_num_iters}
+population_size: ${overrides.nes_population_size}
+sigma: ${overrides.nes_sigma}
+lr_mean: ${overrides.nes_lr_mean}
+lr_sigma: ${overrides.nes_lr_sigma}
+lower_bound: ???
+upper_bound: ???
+device: ${device}
+return_mean_elites: true
+min_sigma: ${overrides.nes_min_sigma}
+max_sigma: ${overrides.nes_max_sigma}

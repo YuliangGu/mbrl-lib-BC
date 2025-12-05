@@ -100,6 +100,7 @@ def train(
         terminated = False
         truncated = False
         total_reward = 0.0
+        plan_time_sum = 0.0
         steps_trial = 0
         while not terminated and not truncated:
             # --------------- Model Training -----------------
@@ -127,6 +128,7 @@ def train(
             total_reward += reward
             steps_trial += 1
             env_steps += 1
+            plan_time_sum += getattr(agent, "last_plan_time", 0.0)
 
             if debug_mode:
                 print(f"Step {env_steps}: Reward {reward:.3f}.")
@@ -134,7 +136,13 @@ def train(
         if logger is not None:
             logger.log_data(
                 mbrl.constants.RESULTS_LOG_NAME,
-                {"env_step": env_steps, "episode_reward": total_reward},
+                {
+                    "env_step": env_steps,
+                    "episode_reward": total_reward,
+                    "planning_time_ms": 1000.0
+                    * plan_time_sum
+                    / max(1, steps_trial),
+                },
             )
         current_trial += 1
         if debug_mode:

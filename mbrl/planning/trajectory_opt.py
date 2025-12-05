@@ -323,8 +323,65 @@ class DecentCEMOptimizer(Optimizer):
         return best_solution
 
 class BCCEMOptimizer(DecentCEMOptimizer):
-    """ TESTING: Bregman(KL)-Centroid guided ensemble CEM method. """
-    
+    """Bregman-centroid preconditioned ensemble CEM.
+
+    - Keeps the same sampling / elite selection / update logic as DecentCEM.
+    - Each iteration:
+        * Computes Bregman centroid mu_c and Information Radius (IR).
+        * Estimates a per-dimension second moment v (ensemble spread in KL metric).
+        * Pre-conditions worker mean updates with v (BC-Adam style).
+        * Optional Adam-style bias correction and sigma_c-scaled damping in the
+          preconditioner.
+    - No respawn / worker reallocation here: this is a "local" upgrade.
+    """
+
+    def __init__(
+        self,
+        num_iterations: int,
+        elite_ratio: float,
+        population_size: int,
+        lower_bound: Sequence[Sequence[float]],
+        upper_bound: Sequence[Sequence[float]],
+        alpha: float,
+        device: torch.device,
+        num_workers: int = 4,
+        return_mean_elites: bool = False,
+        clipped_normal: bool = False,
+        init_jitter_scale: float = 0.0,
+        # --- BC / preconditioning knobs ---
+        tau: float = 1.0,           # worker weight temperature (higher = more uniform)
+        enable_precond: bool = True,
+        beta2: float = 0.9,         # EMA for v (second moment)
+        precond_min: float = 0.3,   # clamp for preconditioner scale 
+        precond_max: float = 1.5,   # clamp for preconditioner scale 
+        bias_correction: bool = True,  # Adam-style bias correction for v
+        sigma_precond_scale: float = 0.5,  # scale "+1" term by sigma_c magnitude
+    ):
+        super().__init__(
+            num_iterations,
+            elite_ratio,
+            population_size,
+            lower_bound,
+            upper_bound,
+            alpha,
+            device,
+            num_workers,
+            return_mean_elites,
+            clipped_normal,
+            init_jitter_scale,
+        )
+        self.tau = tau
+        self.enable_precond = enable_precond
+        self.beta2 = beta2
+        self.precond_min = precond_min
+        self.precond_max = precond_max
+        self.bias_correction = bias_correction
+        self.sigma_precond_scale = sigma_precond_scale
+
+        # running second moment in "normalized" family space, like Adam's v_t
+        self._v = None  # will be (H, A)
+        self._v_step = 0
+
     def optimize(
         self,
         obj_fun: Callable[[torch.Tensor], torch.Tensor],
@@ -332,27 +389,30 @@ class BCCEMOptimizer(DecentCEMOptimizer):
         callback: Optional[
             Callable[
                 [
-                    torch.Tensor,
-                    torch.Tensor,
-                    int,
-                    torch.Tensor,
-                    torch.Tensor,
-                    torch.Tensor,
+                    torch.Tensor,  # flat_population
+                    torch.Tensor,  # values_flat
+                    int,           # iteration
+                    torch.Tensor,  # IR
+                    torch.Tensor,  # mu_c
+                    torch.Tensor,  # sigma_c
                 ],
                 None,
             ]
         ] = None,
         **kwargs,
     ) -> torch.Tensor:
-        tau = kwargs.pop("tau", 1.0)    # higher tau -> more uniform weights
         mu, dispersion = self._init_population_params(x0)
         best_solution = torch.empty_like(x0)
         best_value = -np.inf
         best_worker_idx = 0
+
         population = torch.zeros(
-            (self.num_workers, self.population_size) + x0.shape, device=self.device
+            (self.num_workers, self.population_size) + x0.shape,
+            device=self.device,
         )
+
         for i in range(self.num_iterations):
+            # --- 1) Sample and evaluate ---
             population = self._sample_population(mu, dispersion, population)
             flat_population = population.reshape(-1, *x0.shape)
             values = obj_fun(flat_population).reshape(
@@ -360,36 +420,106 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             )
             values[values.isnan()] = -1e-10
 
+            # callback later, after BC/IR computed
+
+            # elites per worker
             best_values, elite_idx = values.topk(self.elite_num, dim=1)
             worker_indices = torch.arange(self.num_workers, device=self.device).view(
                 -1, 1
             )
             elite = population[worker_indices, elite_idx]
 
+            # --- 2) Standard DecentCEM update (raw step) ---
+            mu_old = mu.clone()  # keep old means to see the raw step
             mu, dispersion = self._update_population_params(elite, mu, dispersion)
 
-            """ TESTING adds-on: no algorithmic change to original CEM """
-            # per-iteration worker quality: best value[:,0]
-            # rewards = best_values[:, 0] # shape: (num_workers, )
-            rewards = torch.mean(best_values, dim=1)  # shape: (num_workers, ) try average
-            logits = (rewards - rewards.max()) / tau  # tau: temperature parameter for softmax
-            w = torch.softmax(logits, dim=0)  # worker weights
+            # --- 3) BC + IR + second moment v (from raw mu) ---
+            # worker "rewards": average elite value per worker
+            rewards = torch.mean(best_values, dim=1)  # (K,)
 
+            # try average of all samples instead of elites only
+            # rewards = torch.mean(values, dim=1)  # (K,)
+
+            logits = (rewards - rewards.max()) / max(self.tau, 1e-8)
+            w = torch.softmax(logits, dim=0)  # (K,)
+
+            # centroid over worker means
+            mu_c_raw = (w.view(-1, 1, 1) * mu).sum(dim=0)  # (H, A)
+
+            # centroid variance proxy sigma^2_c_raw
+            if self._clipped_normal:
+                # dispersion is std
+                sigma2_c_raw = (w.view(-1, 1, 1) * (dispersion ** 2)).sum(dim=0)
+            else:
+                # dispersion is var
+                sigma2_c_raw = (w.view(-1, 1, 1) * dispersion).sum(dim=0)
+            sigma2_c_raw = torch.clamp(sigma2_c_raw, min=1e-6)
+            sigma_c_raw = torch.sqrt(sigma2_c_raw)
+
+            # normalized offsets: diff = (mu - mu_c)/sigma_c
+            diff_raw = (mu - mu_c_raw) / (sigma_c_raw + self._eps)  # (K, H, A)
+
+            # per-worker divergence gamma_k and IR_raw
+            gamma_raw = 0.5 * (diff_raw * diff_raw).sum(dim=(1, 2))  # (K,)
+            IR_raw = (w * gamma_raw).sum()
+
+            # per-dimension second moment v_current (ensemble spread in KL metric)
+            # v_current[j] = sum_k w_k * diff_{k,j}^2
+            v_current = (w.view(-1, 1, 1) * (diff_raw ** 2)).sum(dim=0)  # (H, A)
+
+            # --- 4) preconditioning of the step ---
+            if self.enable_precond:
+                self._v_step += 1
+                if self._v is None:
+                    self._v = v_current.detach()
+                else:
+                    self._v = (
+                        self.beta2 * self._v
+                        + (1.0 - self.beta2) * v_current.detach()
+                    )
+
+                norm_v = self._v
+                if self.bias_correction:
+                    bias_corr = 1.0 - (self.beta2 ** self._v_step)
+                    norm_v = norm_v / (bias_corr + self._eps)
+
+                # preconditioner: smaller where spread is large
+                sigma_offset = torch.clamp(
+                    1.0 + self.sigma_precond_scale * sigma_c_raw, min=self._eps
+                )
+                precond = 1.0 / torch.sqrt(norm_v + sigma_offset)  # (H, A)
+                precond = precond.clamp(self.precond_min, self.precond_max)
+                precond = precond.unsqueeze(0)  # (1, H, A) for broadcasting
+
+                step = mu - mu_old  # raw worker steps (K, H, A)
+                mu = mu_old + precond * step  # preconditioned step (all workers)
+
+            # --- 5) Recompute centroid & IR with preconditioned mu ---
             mu_c = (w.view(-1, 1, 1) * mu).sum(dim=0)  # (H, A)
 
-            # simple variance proxy: use average dispersion as sigma^2
-            sigma2_c = (w.view(-1, 1, 1) * dispersion).sum(dim=0)  # (H, A)
-            sigma2_c = torch.clamp(sigma2_c, min=1e-3)  # avoid IR explosion
+            if self._clipped_normal:
+                sigma2_c = (w.view(-1, 1, 1) * (dispersion ** 2)).sum(dim=0)
+            else:
+                sigma2_c = (w.view(-1, 1, 1) * dispersion).sum(dim=0)
+            sigma2_c = torch.clamp(sigma2_c, min=1e-6)
+            sigma_c = torch.sqrt(sigma2_c)
 
-            # gamma and IR
-            diff = (mu - mu_c) / torch.sqrt(sigma2_c) # boardcast to (K, H, A)
-            gamma = 0.5 * (diff * diff).sum(dim=(1,2))  # (K, ) | Bregman divergence
-            IR = (w * gamma).sum()  # Information Radius
+            diff = (mu - mu_c) / (sigma_c + self._eps)  # (K, H, A)
+            gamma = 0.5 * (diff * diff).sum(dim=(1, 2))  # (K,)
+            IR = (w * gamma).sum()
 
+            # --- 6) Callback with BC/IR info (for logging / analysis) ---
             if callback is not None:
-                sigma_c = torch.sqrt(sigma2_c)
-                callback(flat_population, values.reshape(-1), i, IR, mu_c, sigma_c)
+                callback(
+                    flat_population,
+                    values.reshape(-1),
+                    i,
+                    IR,
+                    mu_c,
+                    sigma_c,
+                )
 
+            # --- 7) Same best-solution tracking as DecentCEM ---
             worker_best_values = best_values[:, 0]
             candidate_value, candidate_worker = torch.max(worker_best_values, dim=0)
             candidate_value_item = float(candidate_value)
@@ -402,7 +532,8 @@ class BCCEMOptimizer(DecentCEMOptimizer):
 
         if self.return_mean_elites:
             return mu[best_worker_idx]
-        return best_solution   # Override optimize method
+        return best_solution
+
 
 class GMMCEMOptimizer(Optimizer):
     """Runs a Gaussian Mixture Model variant of CEM with optional initial mean jitter."""
@@ -437,6 +568,9 @@ class GMMCEMOptimizer(Optimizer):
         self._clipped_normal = clipped_normal
         self._eps = 1e-8
         self.init_jitter_scale = init_jitter_scale
+
+        # EXTRA: min component weight to avoid collapse
+        self.min_component_weight = max(0.0, float(0.1))
 
     def _init_population_params(
         self, x0: torch.Tensor
@@ -561,6 +695,12 @@ class GMMCEMOptimizer(Optimizer):
             mu = self.alpha * mu + (1 - self.alpha) * new_mu
             dispersion = self.alpha * dispersion + (1 - self.alpha) * new_dispersion
             mix_update = comp_weight / (comp_weight.sum() + self._eps)
+            if self.min_component_weight > 0:
+                mix_update = torch.clamp(
+                    mix_update,
+                    min=self.min_component_weight,
+                )
+                mix_update = mix_update / (mix_update.sum() + self._eps)
             mix = self.alpha * mix + (1 - self.alpha) * mix_update
             mix = mix / (mix.sum() + self._eps)
 
@@ -1281,10 +1421,11 @@ class TrajectoryOptimizerAgent(Agent):
             "action_lb": np.array(action_lb),
             "action_ub": np.array(action_ub),
         }
-        self.trajectory_eval_fn: mbrl.types.TrajectoryEvalFnType = None
-        self.actions_to_use: List[np.ndarray] = []
         self.replan_freq = replan_freq
         self.verbose = verbose
+        self.actions_to_use: List[np.ndarray] = []
+        self.last_plan_time: float = 0.0
+        self.trajectory_eval_fn: mbrl.types.TrajectoryEvalFnType = None
 
     def set_trajectory_eval_fn(
         self, trajectory_eval_fn: mbrl.types.TrajectoryEvalFnType
@@ -1343,6 +1484,7 @@ class TrajectoryOptimizerAgent(Agent):
                 trajectory_eval_fn, callback=optimizer_callback
             )
             plan_time = time.time() - start_time
+            self.last_plan_time = plan_time
 
             self.actions_to_use.extend([a for a in plan[: self.replan_freq]])
         action = self.actions_to_use.pop(0)

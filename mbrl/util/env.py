@@ -66,33 +66,46 @@ def _legacy_make_env(
         env = gym.make(cfg.overrides.env.split("___")[1])
         term_fn, reward_fn = _get_term_and_reward_fn(cfg)
     else:
-        import mbrl.env.mujoco_envs
-
+        # Only import mujoco-based envs when needed to avoid optional dependency failures.
         if cfg.overrides.env == "cartpole_continuous":
-            env = mbrl.env.cartpole_continuous.CartPoleEnv()
-            term_fn = mbrl.env.termination_fns.cartpole
-            reward_fn = mbrl.env.reward_fns.cartpole
+            from mbrl.env import cartpole_continuous, reward_fns, termination_fns
+
+            env = cartpole_continuous.CartPoleEnv()
+            term_fn = termination_fns.cartpole
+            reward_fn = reward_fns.cartpole
         elif cfg.overrides.env == "cartpole_pets_version":
+            import mbrl.env.mujoco_envs
+
             env = mbrl.env.mujoco_envs.CartPoleEnv()
             term_fn = mbrl.env.termination_fns.no_termination
             reward_fn = mbrl.env.reward_fns.cartpole_pets
         elif cfg.overrides.env == "pets_halfcheetah":
+            import mbrl.env.mujoco_envs
+
             env = mbrl.env.mujoco_envs.HalfCheetahEnv()
             term_fn = mbrl.env.termination_fns.no_termination
             reward_fn = getattr(mbrl.env.reward_fns, "halfcheetah", None)
         elif cfg.overrides.env == "pets_reacher":
+            import mbrl.env.mujoco_envs
+
             env = mbrl.env.mujoco_envs.Reacher3DEnv()
             term_fn = mbrl.env.termination_fns.no_termination
             reward_fn = None
         elif cfg.overrides.env == "pets_pusher":
+            import mbrl.env.mujoco_envs
+
             env = mbrl.env.mujoco_envs.PusherEnv()
             term_fn = mbrl.env.termination_fns.no_termination
             reward_fn = mbrl.env.reward_fns.pusher
         elif cfg.overrides.env == "ant_truncated_obs":
+            import mbrl.env.mujoco_envs
+
             env = mbrl.env.mujoco_envs.AntTruncatedObsEnv()
             term_fn = mbrl.env.termination_fns.ant
             reward_fn = None
         elif cfg.overrides.env == "humanoid_truncated_obs":
+            import mbrl.env.mujoco_envs
+
             env = mbrl.env.mujoco_envs.HumanoidTruncatedObsEnv()
             term_fn = mbrl.env.termination_fns.humanoid
             reward_fn = None

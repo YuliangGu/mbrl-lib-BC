@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - override /algorithm: pets
+  - override /overrides: pets_cartpole
+  - override /dynamics_model: gaussian_mlp_ensemble
+  - override /action_optimizer: cem
+  - _self_
+
+experiment: pets_optimizer_benchmark
+
+# Extra hyperparameters for optimizers that are not covered by the base override.
+overrides:
+  cem_population_decay_factor: 1.3
+  cem_colored_noise_exponent: 2.0
+  cem_keep_elite_frac: 0.3
+  nes_num_iters: 5
+  nes_population_size: 350
+  nes_sigma: 1.0
+  nes_lr_mean: 0.3
+  nes_lr_sigma: 0.15
+  nes_min_sigma: 1e-3
+  nes_max_sigma: null
+  cma_num_iters: 5
+  cma_population_size: 350
+  cma_elite_ratio: 0.25
+  cma_sigma: 1.0
+  cma_alpha: 0.2
+  mppi_num_iters: 5
+  mppi_population_size: 350
+  mppi_gamma: 0.9
+  mppi_sigma: 1.0
+  mppi_beta: 0.9

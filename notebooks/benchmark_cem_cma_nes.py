@@ -29,9 +29,10 @@ def rosenbrock(actions: torch.Tensor, a: float = 1.0, b: float = 100.0) -> torch
 
 
 def rastrigin(actions: torch.Tensor) -> torch.Tensor:
+    freq = 1.2 * math.pi
     flat = actions.view(actions.shape[0], -1)
     dim = flat.shape[1]
-    return -(10 * dim + (flat * flat - 10 * torch.cos(2 * math.pi * flat)).sum(dim=1))
+    return -(10 * dim + (flat * flat - 10 * torch.cos(freq * flat)).sum(dim=1))
 
 
 Objective = Callable[[torch.Tensor], torch.Tensor]
@@ -91,15 +92,17 @@ def benchmark(
     upper = np.full((planning_horizon, action_dim), 2.0).tolist()
     x0 = torch.zeros((planning_horizon, action_dim), device=device)
 
-    num_iters = 4
+    init_jitter_scale = 1.0
+    num_workers = 5 
+    num_iters = 5
     per_iter_budget =  500 # total samples evaluated per iteration for fairness
 
     factories = {
         "CEM": lambda: planning.CEMOptimizer(
             num_iterations=num_iters,
-            elite_ratio=0.1,
+            elite_ratio=0.15,
             population_size=per_iter_budget,
-            alpha=0.1,
+            alpha=0.2,
             lower_bound=lower,
             upper_bound=upper,
             device=device,
@@ -107,49 +110,50 @@ def benchmark(
         ),
         "DecentCEM": lambda: planning.DecentCEMOptimizer(
             num_iterations=num_iters,
-            elite_ratio=0.1,
-            population_size=per_iter_budget // 3,
-            alpha=0.1,
+            elite_ratio=0.15,
+            population_size=per_iter_budget // num_workers,
+            alpha=0.2,
             lower_bound=lower,
             upper_bound=upper,
-            num_workers=3,
+            num_workers=num_workers,
             device=device,
             return_mean_elites=True,
-            init_jitter_scale=1.0,
+            init_jitter_scale=init_jitter_scale,
         ),
         "BCCEM": lambda: planning.BCCEMOptimizer(
             num_iterations=num_iters,
-            elite_ratio=0.1,
-            population_size=per_iter_budget // 3,
-            alpha=0.1,
+            elite_ratio=0.15,
+            population_size=per_iter_budget // num_workers,
+            alpha=0.2,
             lower_bound=lower,
             upper_bound=upper,
-            num_workers=3,
+            num_workers=num_workers,
             device=device,
             return_mean_elites=True,
-            init_jitter_scale=1.0,
+            init_jitter_scale=init_jitter_scale,
         ),
         "GMMCEM": lambda: planning.GMMCEMOptimizer(
             num_iterations=num_iters,
-            elite_ratio=0.15,
-            population_size=math.ceil(per_iter_budget / 3),
-            num_workers=3,
+            elite_ratio=0.2,
+            population_size=math.ceil(per_iter_budget / num_workers),
+            num_workers=num_workers,
             alpha=0.2,
             lower_bound=lower,
             upper_bound=upper,
             device=device,
             return_mean_elites=True,
-            init_jitter_scale=1.0,
+            init_jitter_scale=init_jitter_scale,
         ),
         "CMAES": lambda: planning.CMAESOptimizer(
             num_iterations=num_iters,
             population_size=per_iter_budget,
-            elite_ratio=0.25,
+            elite_ratio=0.15,
             sigma=1.0,
             lower_bound=lower,
             upper_bound=upper,
             alpha=0.2,
             device=device,
+            adaptation="full",
             return_mean_elites=True,
         ),
         "NES": lambda: planning.NESOptimizer(
