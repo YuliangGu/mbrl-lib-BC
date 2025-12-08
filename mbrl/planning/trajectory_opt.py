@@ -206,6 +206,7 @@ class DecentCEMOptimizer(Optimizer):
         return_mean_elites: bool = False,
         clipped_normal: bool = False,
         init_jitter_scale: float = 0.0,
+        min_component_weight: float = 0.1,
     ):
         super().__init__()
         self.num_iterations = num_iterations
@@ -420,26 +421,19 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             )
             values[values.isnan()] = -1e-10
 
-            # callback later, after BC/IR computed
-
-            # elites per worker
             best_values, elite_idx = values.topk(self.elite_num, dim=1)
             worker_indices = torch.arange(self.num_workers, device=self.device).view(
                 -1, 1
             )
             elite = population[worker_indices, elite_idx]
 
-            # --- 2) Standard DecentCEM update (raw step) ---
-            mu_old = mu.clone()  # keep old means to see the raw step
+            # --- 2) Update population params (mu, dispersion) ---
+            mu_old = mu.clone()  
             mu, dispersion = self._update_population_params(elite, mu, dispersion)
 
             # --- 3) BC + IR + second moment v (from raw mu) ---
             # worker "rewards": average elite value per worker
             rewards = torch.mean(best_values, dim=1)  # (K,)
-
-            # try average of all samples instead of elites only
-            # rewards = torch.mean(values, dim=1)  # (K,)
-
             logits = (rewards - rewards.max()) / max(self.tau, 1e-8)
             w = torch.softmax(logits, dim=0)  # (K,)
 
@@ -448,12 +442,10 @@ class BCCEMOptimizer(DecentCEMOptimizer):
 
             # centroid variance proxy sigma^2_c_raw
             if self._clipped_normal:
-                # dispersion is std
                 sigma2_c_raw = (w.view(-1, 1, 1) * (dispersion ** 2)).sum(dim=0)
             else:
-                # dispersion is var
                 sigma2_c_raw = (w.view(-1, 1, 1) * dispersion).sum(dim=0)
-            sigma2_c_raw = torch.clamp(sigma2_c_raw, min=1e-6)
+            sigma2_c_raw = torch.clamp(sigma2_c_raw, min=DISPERSION_EPS)
             sigma_c_raw = torch.sqrt(sigma2_c_raw)
 
             # normalized offsets: diff = (mu - mu_c)/sigma_c
@@ -467,9 +459,8 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             # v_current[j] = sum_k w_k * diff_{k,j}^2
             v_current = (w.view(-1, 1, 1) * (diff_raw ** 2)).sum(dim=0)  # (H, A)
 
-            # --- 4) preconditioning of the step ---
+            # --- 4) Adam-style preconditioning of the step ---
             if self.enable_precond:
-                self._v_step += 1
                 if self._v is None:
                     self._v = v_current.detach()
                 else:
@@ -478,16 +469,12 @@ class BCCEMOptimizer(DecentCEMOptimizer):
                         + (1.0 - self.beta2) * v_current.detach()
                     )
 
-                norm_v = self._v
-                if self.bias_correction:
-                    bias_corr = 1.0 - (self.beta2 ** self._v_step)
-                    norm_v = norm_v / (bias_corr + self._eps)
+                # normalize v by its mean to get a dimensionless spread
+                v_mean = self._v.mean()
+                norm_v = self._v / (v_mean + self._eps)
 
                 # preconditioner: smaller where spread is large
-                sigma_offset = torch.clamp(
-                    1.0 + self.sigma_precond_scale * sigma_c_raw, min=self._eps
-                )
-                precond = 1.0 / torch.sqrt(norm_v + sigma_offset)  # (H, A)
+                precond = 1.0 / torch.sqrt(norm_v + 1.0)  # (H, A)
                 precond = precond.clamp(self.precond_min, self.precond_max)
                 precond = precond.unsqueeze(0)  # (1, H, A) for broadcasting
 
@@ -551,6 +538,7 @@ class GMMCEMOptimizer(Optimizer):
         return_mean_elites: bool = False,
         clipped_normal: bool = False,
         init_jitter_scale: float = 0.0,
+        min_component_weight: float = 0.1,
     ):
         super().__init__()
         self.num_iterations = num_iterations
@@ -570,7 +558,7 @@ class GMMCEMOptimizer(Optimizer):
         self.init_jitter_scale = init_jitter_scale
 
         # EXTRA: min component weight to avoid collapse
-        self.min_component_weight = max(0.0, float(0.1))
+        self.min_component_weight = max(0.0, float(min_component_weight))
 
     def _init_population_params(
         self, x0: torch.Tensor
@@ -710,7 +698,6 @@ class GMMCEMOptimizer(Optimizer):
         if self.return_mean_elites:
             return mu[best_worker]
         return best_solution
-
 
 class NESOptimizer(Optimizer):
     """Implements a Natural Evolution Strategy (NES) optimizer.

@@ -1,5 +1,8 @@
 *personal*
 exp/
+data/
+out/
+.hydra/
 .python-version
 .vscode
 .idea

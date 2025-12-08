@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--agg",
         choices=["max", "last", "mean"],
-        default="max",
+        default="mean",
         help="Reduction over each run's timeseries (for episode_reward use max/last; for planning_time_ms use mean).",
     )
     parser.add_argument(
@@ -80,6 +80,8 @@ def load_metric(
     curve: List[Tuple[float, float]] = []
     with results_path.open("r", newline="") as f:
         reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError(f"No columns found in {results_path}")
         if metric != "training_curve" and metric not in reader.fieldnames:
             raise KeyError(f"Metric '{metric}' not found in {results_path}")
         for row in reader:

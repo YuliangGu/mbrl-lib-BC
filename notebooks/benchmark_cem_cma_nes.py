@@ -205,7 +205,7 @@ def plot_curves(curves: Dict[str, np.ndarray], title: str, filename: str) -> Non
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(filename, dpi=150)
-    plt.show()
+    # plt.show()
 
 
 def plot_bccem_diagnostics(
@@ -272,7 +272,7 @@ def plot_bccem_diagnostics(
     fig.suptitle(title)
     plt.tight_layout()
     plt.savefig(f"{filename_prefix}_bccem.png", dpi=150)
-    plt.show()
+    # plt.show()
 
 
 def plot_population_snapshots(
@@ -309,7 +309,7 @@ def plot_population_snapshots(
     plt.ylabel("y")
     plt.tight_layout()
     plt.savefig(filename, dpi=150)
-    plt.show()
+    # plt.show()
 
 
 def plot_kde_subplots(
@@ -376,7 +376,7 @@ def plot_kde_subplots(
     fig.suptitle(title)
     plt.tight_layout()
     plt.savefig(filename, dpi=150)
-    plt.show()
+    # plt.show()
 
 
 def main() -> None:
@@ -427,6 +427,11 @@ def main() -> None:
         rastrigin_pops,
         "Rastrigin KDEs",
         str(output_dir / "kde_rastrigin.png"),
+    )
+    plot_covariance_matrices(
+        rastrigin_pops,
+        "Rastrigin Covariances",
+        str(output_dir / "cov_rastrigin.png"),
     )
     if "BCCEM" in rastrigin_extra:
         plot_bccem_diagnostics(
