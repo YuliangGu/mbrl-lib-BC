@@ -1,7 +1,7 @@
 *personal*
 exp/
 data/
-out/
+outputs/
 .hydra/
 .python-version
 .vscode
