@@ -3,12 +3,13 @@
 _target_: mbrl.planning.GMMCEMOptimizer
 num_iterations: ${overrides.cem_num_iters}
 elite_ratio: ${overrides.cem_elite_ratio}
-population_size: ${oc.select:overrides.cem_population_size_per_worker,${overrides.cem_population_size}}
+population_size: ${overrides.cem_population_size_per_worker}
 alpha: ${overrides.cem_alpha}
-num_workers: ${oc.select:overrides.cem_num_workers,4}
+num_workers: ${overrides.cem_num_workers}
 lower_bound: ???
 upper_bound: ???
 return_mean_elites: true
 device: ${device}
 clipped_normal: ${overrides.cem_clipped_normal}
 min_component_weight: 0.01
+init_jitter_scale: ${overrides.cem_init_jitter_scale}
