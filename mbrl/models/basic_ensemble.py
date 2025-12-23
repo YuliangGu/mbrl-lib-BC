@@ -71,7 +71,15 @@ class BasicEnsemble(Ensemble):
         )
         self.members = []
         for i in range(ensemble_size):
-            model = hydra.utils.instantiate(member_cfg)
+            # The member configs often contain nested Hydra configs (e.g., activation functions)
+            # that are expected to be instantiated by the member itself, not by Hydra
+            # recursively. Disable recursion here to keep those configs intact.
+            try:
+                model = hydra.utils.instantiate(member_cfg, _recursive_=False)
+            except Exception as e:
+                if "_recursive_" not in str(e):
+                    raise
+                model = hydra.utils.instantiate(member_cfg)
             self.members.append(model)
         self.deterministic = self.members[0].deterministic
         self.in_size = getattr(self.members[0], "in_size", None)

@@ -5,6 +5,7 @@
 import math
 import time
 import inspect
+from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Tuple, cast
 
 import hydra
@@ -24,16 +25,27 @@ DISPERSION_EPS = 1e-4
 ObjectiveFn = Callable[[torch.Tensor], torch.Tensor]
 OptimizerCallback = Optional[Callable[[torch.Tensor, torch.Tensor, int], None]]
 
+@dataclass
+class BCCEMParams:
+    consensus_coef: float = 0.25
+    consensus_anneal_power: float = 1.0
+    use_value_weights: bool = True
+    ir_low: float = 0.3
+    ir_high: float = 0.6
+    ir_high_target: Optional[float] = None
+    early_stop: bool = True
+    early_stop_ir: float = 0.2
+    early_stop_mu: float = 1e-3
+    early_stop_patience: int = 1
+
 class Optimizer:
     """Base class for trajectory optimizers.
 
-    The mbrl library expects optimizers to expose a simple ``optimize()`` API that returns a
-    best-found solution tensor. For benchmarking and MPC integration, we also provide a few
+    For benchmarking and MPC integration, we provide a few
     optional hooks (diagnostics, persistent state).
     """
 
     def __init__(self):
-        # Per-instance tensor buffers to avoid allocations in MPC loops.
         self._buffers: dict[str, torch.Tensor] = {}
 
     def _get_buffer(
@@ -57,12 +69,12 @@ class Optimizer:
         return buf
 
     @staticmethod
-    def _sanitize_values_(values: torch.Tensor, nan: float = -1e-10) -> torch.Tensor:
-        # Avoid allocating an isnan mask on every iteration.
+    def _sanitize_values_(values: torch.Tensor) -> torch.Tensor:
+        bad = -torch.finfo(values.dtype).max
         try:
-            torch.nan_to_num_(values, nan=nan)
-        except AttributeError:
-            values[values.isnan()] = nan
+            torch.nan_to_num_(values, nan=bad, posinf=bad, neginf=bad)
+        except TypeError:
+            values[~torch.isfinite(values)] = bad
         return values
 
     def optimize(
@@ -316,8 +328,7 @@ class DecentCEMOptimizer(Optimizer):
         self.elite_ratio = elite_ratio
         self.num_workers = num_workers
         if total_population_size is not None:
-            # Split the total population budget across workers (rounded up).
-            population_size = int(math.ceil(float(total_population_size) / float(max(1, num_workers))))
+            population_size = int(math.ceil(float(total_population_size) / float(max(1, num_workers)))) # rounded up.
         self.population_size = int(population_size)
         self.total_population_size = self.population_size * self.num_workers
         self.elite_num = max(1, int(np.ceil(self.population_size * self.elite_ratio)))
@@ -447,13 +458,15 @@ class BCCEMOptimizer(DecentCEMOptimizer):
         clipped_normal: bool = False,
         init_jitter_scale: float = 0.0,
         # ---- BC-CEM specific knobs ----
-        consensus_coef: float = 0.2,
-        consensus_anneal_power: float = 1.0,
+        bcem_params: Optional[BCCEMParams] = None,
+        consensus_coef: float = 0.3,
+        consensus_anneal_power: float = 0.75,
         use_value_weights: bool = True,
-        ir_low: float = 0.1,
-        ir_high: float = 1.0,
+        ir_low: float = 0.2,
+        ir_high: float = 0.6,
+        ir_high_target: Optional[float] = None,
         early_stop: bool = True,
-        early_stop_ir: float = 0.05,
+        early_stop_ir: float = 0.2,
         early_stop_mu: float = 1e-3,
         early_stop_patience: int = 1,
     ):
@@ -472,14 +485,19 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             init_jitter_scale=init_jitter_scale,
         )
 
-        self.consensus_coef = consensus_coef
-        self.consensus_anneal_power = consensus_anneal_power
-        self.use_value_weights = use_value_weights
-        self.ir_low, self.ir_high = ir_low, ir_high
-        self.early_stop = early_stop
-        self.early_stop_ir = early_stop_ir
-        self.early_stop_mu = early_stop_mu
-        self.early_stop_patience = early_stop_patience
+        self.bcem_params = bcem_params or BCCEMParams(
+            consensus_coef=consensus_coef,
+            consensus_anneal_power=consensus_anneal_power,
+            use_value_weights=use_value_weights,
+            ir_low=ir_low,
+            ir_high=ir_high,
+            ir_high_target=ir_high_target,
+            early_stop=early_stop,
+            early_stop_ir=early_stop_ir,
+            early_stop_mu=early_stop_mu,
+            early_stop_patience=early_stop_patience,
+        )
+        self._ir_high_start = float(self.bcem_params.ir_high)
 
         # BC-CEM internal state used by MPC 
         self._centroid_type = "moment"
@@ -524,9 +542,11 @@ class BCCEMOptimizer(DecentCEMOptimizer):
         elem = log_term + quad - 1.0
         return 0.5 * elem.sum(dim=tuple(range(1, elem.dim())))
 
-    def _compute_worker_weights(self, worker_scores: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    def _compute_worker_weights(
+        self, worker_scores: torch.Tensor, temperature: float = 1.0
+    ) -> torch.Tensor:
         W = int(worker_scores.shape[0])
-        if (not self.use_value_weights) or (W <= 1):
+        if (not self.bcem_params.use_value_weights) or (W <= 1):
             return torch.full((W,), 1.0 / max(1, W), device=worker_scores.device)
 
         logits = worker_scores / temperature
@@ -570,18 +590,35 @@ class BCCEMOptimizer(DecentCEMOptimizer):
         **kwargs,
     ) -> torch.Tensor:
         self.reset()
+        cfg = self.bcem_params
+        consensus_coef = float(cfg.consensus_coef)
+        consensus_anneal_power = float(cfg.consensus_anneal_power)
+        ir_low = float(cfg.ir_low)
+        ir_high = float(cfg.ir_high)
+        early_stop = bool(cfg.early_stop)
+        early_stop_ir = float(cfg.early_stop_ir)
+        early_stop_mu = float(cfg.early_stop_mu)
+        early_stop_patience = int(cfg.early_stop_patience)
+
         mu_w, disp_w = self._init_population_params(x0, jitter_scale=self.init_jitter_scale)
 
         W = int(self.num_workers)
         weights = torch.full((W,), 1.0 / max(1, W), device=self.device)
         dim = int(x0.numel())
-        population = self._get_buffer("population", (W, self.population_size) + tuple(x0.shape), device=self.device,)
+        population = self._get_buffer(
+            "population",
+            (W, self.population_size) + tuple(x0.shape),
+            device=self.device,
+        )
 
-        # track global/per-worker bests (mean of elites)
         best_solution = torch.empty_like(x0)
         best_value = -float("inf")
         best_worker_idx = 0
-        worker_best_solution = self._get_buffer("worker_best_solution", (W,) + tuple(x0.shape), device=self.device)
+        worker_best_solution = self._get_buffer(
+            "worker_best_solution",
+            (W,) + tuple(x0.shape),
+            device=self.device,
+        )
         worker_best_value = torch.full((W,), -float("inf"), device=self.device)
 
         prev_mu_c: Optional[torch.Tensor] = None
@@ -600,7 +637,6 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             if callback is not None:
                 callback(flat_population, values.reshape(-1), i)
 
-            # decentralized update
             best_values, elite_idx = values.topk(self.elite_num, dim=1)
             worker_indices = torch.arange(W, device=self.device).view(-1, 1)
             elite = population[worker_indices, elite_idx]
@@ -610,10 +646,13 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             iter_best_solutions = elite[:, 0]
             improved = iter_best_vals > worker_best_value
             if torch.any(improved):
-                worker_best_value = torch.where(improved, iter_best_vals, worker_best_value)
-                worker_best_solution = torch.where(improved.view(-1, 1, 1), iter_best_solutions, worker_best_solution)
+                worker_best_value = torch.where(
+                    improved, iter_best_vals, worker_best_value
+                )
+                worker_best_solution = torch.where(
+                    improved.view(-1, 1, 1), iter_best_solutions, worker_best_solution
+                )
 
-            # update global best
             cand_val, cand_worker = torch.max(iter_best_vals, dim=0)
             cand_val_item = float(cand_val)
             if cand_val_item > best_value:
@@ -621,13 +660,15 @@ class BCCEMOptimizer(DecentCEMOptimizer):
                 best_worker_idx = int(cand_worker)
                 best_solution = iter_best_solutions[best_worker_idx].clone()
 
-            # (EXPERIMENTAL) consider using quantile-based worker weights for robustness
+            # ---- BC-CEM specific logic ----
             value_quantiles = torch.quantile(values, 0.5, dim=1)  # median per worker
-            weights = self._compute_worker_weights(value_quantiles) 
-            mu_c, disp_c, var_c = self._centroid_from_workers(mu_w, disp_w, weights, centroid_type=self._centroid_type)
+            weights = self._compute_worker_weights(value_quantiles)
+            mu_c, disp_c, var_c = self._centroid_from_workers(
+                mu_w, disp_w, weights, centroid_type=self._centroid_type
+            )
             var_w = self._as_var(disp_w)
             if self._centroid_type == "moment":
-                kl_w = self._diag_gaussian_kl(mu_w, var_w, mu_c, var_c) 
+                kl_w = self._diag_gaussian_kl(mu_w, var_w, mu_c, var_c)
             else:
                 kl_w = self._diag_gaussian_kl(mu_c, var_c, mu_w, var_w)
 
@@ -638,13 +679,14 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             last_ir_max = float(ir_max.detach().cpu())
             last_ir_norm = float(ir_norm.detach().cpu())
 
-            # [Optional] consensus pull 
-            beta = float(self.consensus_coef) * float(((i + 1) / max(1, self.num_iterations)) ** float(self.consensus_anneal_power))
+            beta = consensus_coef * float(((i + 1) / max(1, self.num_iterations)) ** consensus_anneal_power)
             beta = max(0.0, min(1.0, beta))
             if beta > 0.0 and W > 1:
-                inv_dim = 1.0 / float(max(1, dim))
-                scale = (kl_w * inv_dim).clamp(min=0.0)
-                beta_w = (beta * (scale / (1.0 + scale))).clamp(0.0, 1.0)
+                scale = (kl_w * 1.0 / float(max(1, dim))).clamp(min=0.0)
+                """EXPERIMENTAL: try different scaling strategies for beta
+                """
+                beta_w = (beta * (scale / (1.0 + scale))).clamp(0.0, 1.0) # farther -> stronger pull
+                # beta_w = (beta * (1.0 / (1.0 + scale))).clamp(0.0, 1.0) # closer -> stronger pull
                 beta_w = beta_w.view(-1, 1, 1)
 
                 mu_w = (1.0 - beta_w) * mu_w + beta_w * mu_c.unsqueeze(0)
@@ -655,17 +697,21 @@ class BCCEMOptimizer(DecentCEMOptimizer):
                 var_w = torch.clamp(var_w, min=DISPERSION_EPS)
                 disp_w = self._from_var(var_w)
 
-            if self.early_stop:
+            if early_stop:
                 mu_shift = None
                 if prev_mu_c is not None:
-                    mu_shift = float(torch.sqrt(torch.mean(torch.square(mu_c - prev_mu_c))).detach().cpu())
+                    mu_shift = float(
+                        torch.sqrt(torch.mean(torch.square(mu_c - prev_mu_c)))
+                        .detach()
+                        .cpu()
+                    )
                 prev_mu_c = mu_c.detach()
                 if (mu_shift is not None) and (last_ir_norm is not None):
-                    if (last_ir_norm <= self.early_stop_ir) and (mu_shift <= self.early_stop_mu):
+                    if (last_ir_norm <= early_stop_ir) and (mu_shift <= early_stop_mu):
                         stall_count += 1
                     else:
                         stall_count = 0
-                    if stall_count >= self.early_stop_patience:
+                    if stall_count >= early_stop_patience:
                         break
 
         mu_c, disp_c, var_c = self._centroid_from_workers(mu_w, disp_w, weights)
@@ -681,35 +727,40 @@ class BCCEMOptimizer(DecentCEMOptimizer):
                 sampled_worker = dist.sample()
                 sampled_solution = mu_w[sampled_worker]
 
-                if last_ir_norm > self.ir_high:
+                if last_ir_norm > ir_high:
+                    # multimodal, sample from modes
                     exec_solution = sampled_solution
                     exec_source = "sampled"
-                elif last_ir_norm < self.ir_low:
+
+                elif last_ir_norm < ir_low:
+                    # unimodal, go to centroid
                     exec_solution = mu_c
                     exec_source = "centroid"
+
                 else:
-                    p_ = (last_ir_norm - self.ir_low) / (self.ir_high - self.ir_low)
-                    if np.random.rand() < p_:
+                    # in-between, Thompson-type sampling
+                    p_ = (last_ir_norm - ir_low) / (ir_high - ir_low)
+                    if torch.rand((), device=weights.device).item() < p_:
                         exec_solution = sampled_solution
                         exec_source = "sampled"
                     else:
                         exec_solution = mu_c
                         exec_source = "centroid"
             else:
-                # best worker mean as fallback
                 exec_solution = mu_w[best_worker_idx]
                 exec_source = "best_worker_mean"
 
         self._diagnostics = {
             "weights": weights.detach().cpu().numpy().tolist(),
-            "weights_entropy": float(-torch.sum(weights * torch.log(weights + 1e-10)).detach().cpu()),
+            "weights_entropy": float(
+                -torch.sum(weights * torch.log(weights + 1e-10)).detach().cpu()
+            ),
             "ir_norm": float(last_ir_norm) if last_ir_norm is not None else None,
             "ir_avg": float(last_ir_avg) if last_ir_avg is not None else None,
             "ir_max": float(last_ir_max) if last_ir_max is not None else None,
             "exec_source": exec_source,
         }
 
-        print(f"[BCCEM] Executing solution from '{exec_source}' with IR norm={last_ir_norm:.6f}, avg={last_ir_avg:.6f}, max={last_ir_max:.6f}, entropy={self._diagnostics['weights_entropy']:.6f}")
         return exec_solution
 
 
@@ -729,6 +780,7 @@ class GMMCEMOptimizer(Optimizer):
         num_workers: int = 4,
         return_mean_elites: bool = False,
         clipped_normal: bool = False,
+        min_component_weight: float = 0.0,
         init_jitter_scale: float = 0.0,
     ):
         super().__init__()
@@ -751,7 +803,37 @@ class GMMCEMOptimizer(Optimizer):
         self.device = device
         self._clipped_normal = clipped_normal
         self._eps = 1e-8
+        self.min_component_weight = float(min_component_weight)
         self.init_jitter_scale = init_jitter_scale
+
+    @staticmethod
+    def _project_onto_simplex(v: torch.Tensor, s: float) -> torch.Tensor:
+        """Projects ``v`` onto the simplex ``{w >= 0, sum(w) = s}``."""
+        if s <= 0:
+            return torch.zeros_like(v)
+        v_sorted, _ = torch.sort(v, descending=True)
+        cssv = torch.cumsum(v_sorted, dim=0) - s
+        ind = torch.arange(1, v.numel() + 1, device=v.device, dtype=v.dtype)
+        cond = v_sorted - cssv / ind > 0
+        if not bool(cond.any()):
+            return torch.full_like(v, s / float(v.numel()))
+        rho = int(torch.nonzero(cond, as_tuple=False)[-1].item())
+        theta = cssv[rho] / float(rho + 1)
+        return torch.clamp(v - theta, min=0.0)
+
+    def _enforce_min_component_weight(self, mix: torch.Tensor) -> torch.Tensor:
+        mix = torch.clamp(mix, min=0.0)
+        mix = mix / (mix.sum() + self._eps)
+        min_w = self.min_component_weight
+        if min_w <= 0:
+            return mix
+        k = int(mix.numel())
+        if min_w * k >= 1.0:
+            return torch.full_like(mix, 1.0 / float(k))
+        v = mix - min_w
+        w = self._project_onto_simplex(v, 1.0 - float(k) * min_w)
+        mix = w + min_w
+        return mix / (mix.sum() + self._eps)
 
     def _init_population_params(
         self, x0: torch.Tensor, jitter_scale: float = 0.0
@@ -774,7 +856,7 @@ class GMMCEMOptimizer(Optimizer):
         mix = torch.full(
             (self.num_workers,), 1.0 / self.num_workers, device=self.device
         )
-        return mean, dispersion, mix
+        return mean, dispersion, self._enforce_min_component_weight(mix)
 
     def _sample_population(
         self,
@@ -894,7 +976,7 @@ class GMMCEMOptimizer(Optimizer):
 
             mix_update = comp_weight / (comp_weight.sum() + self._eps)
             mix = self.alpha * mix + (1 - self.alpha) * mix_update
-            mix = mix / (mix.sum() + self._eps)
+            mix = self._enforce_min_component_weight(mix)
 
             mu = torch.clamp(mu, min=self.lower_bound, max=self.upper_bound)
 
@@ -1464,6 +1546,7 @@ class ICEMOptimizer(Optimizer):
 
         return mu if self.return_mean_elites else best_solution
 
+
 class TrajectoryOptimizer:
     """Class for using generic optimizers on trajectory optimization problems.
 
@@ -1560,6 +1643,18 @@ class TrajectoryOptimizer:
         self.last_plan_debug = None
         self.optimizer.reset()
 
+    def advance(self, steps: int = 1) -> None:
+        """Advances the warm-start solution by ``steps`` without running optimization."""
+        if not self.keep_last_solution:
+            return
+        steps = int(steps)
+        if steps <= 0:
+            return
+        if steps >= self.horizon:
+            self.previous_solution[:] = self._initial_action
+            return
+        self.previous_solution.copy_(self.previous_solution.roll(-steps, dims=0))
+        self.previous_solution[-steps:].copy_(self._initial_action)
 
 class TrajectoryOptimizerAgent(Agent):
     """Agent that performs trajectory optimization on a given objective function for each action.
@@ -1599,15 +1694,18 @@ class TrajectoryOptimizerAgent(Agent):
         verbose: bool = False,
         keep_last_solution: bool = True,
         # NEW: two-stage evaluation
-        two_stage_eval: bool = False,
+        two_stage_eval: bool = True,
         two_stage_particles_frac: float = 0.5,
         two_stage_topk_frac: float = 0.2,
         two_stage_max_topk: int = 64,
         risk_spread_coef: float = 0.0,
-        particle_schedule: str = "fixed",       # "fixed" and "adaptive" (used by BC-CEM)
+        particle_schedule: str = "fixed",       # "fixed" or "ir" (used by BC-CEM)
         particles_min_frac: float = 0.25,
         ir_particles_low: float = 0.35,
         ir_particles_high: float = 1.5,
+        skip_replan_if_ir_low: bool = False,
+        skip_replan_ir_threshold: float = 0.1,
+        skip_replan_max_frac: float = 0.5,
     ):
         self.optimizer = TrajectoryOptimizer(
             optimizer_cfg,
@@ -1625,10 +1723,13 @@ class TrajectoryOptimizerAgent(Agent):
         self.replan_freq = replan_freq
         self.keep_last_solution = keep_last_solution
         self.verbose = verbose
+        self.planning_horizon = planning_horizon
         self._action_cache: Optional[np.ndarray] = None
         self._action_cache_idx: int = 0
+        self._replan_cache_len: int = 0
+        self.replan_skips: int = 0
+        self.last_plan_model_steps_est: int = 0
         self.last_plan_time: float = 0.0
-        self.planned_this_step: bool = False
         self.trajectory_eval_fn: mbrl.types.TrajectoryEvalFnType = None
 
         # ---- objective evaluation knobs (used by create_trajectory_optim_agent_for_model) ----
@@ -1641,12 +1742,12 @@ class TrajectoryOptimizerAgent(Agent):
         self.particles_min_frac = particles_min_frac
         self.ir_particles_low = ir_particles_low
         self.ir_particles_high = ir_particles_high
+        self.skip_replan_if_ir_low = skip_replan_if_ir_low
+        self.skip_replan_ir_threshold = float(skip_replan_ir_threshold)
+        self.skip_replan_max_frac = float(skip_replan_max_frac)
 
         # last plan diagnostics (JSON-serializable dict from optimizer)
         self.last_plan_debug: Optional[dict] = None
-        self._plan_eval_calls: int = 0
-        self._plan_eval_sequences: int = 0
-        self._plan_rollouts_est: int = 0
 
     def set_trajectory_eval_fn(
         self, trajectory_eval_fn: mbrl.types.TrajectoryEvalFnType
@@ -1670,16 +1771,16 @@ class TrajectoryOptimizerAgent(Agent):
                 replan_freq=self.replan_freq,
                 keep_last_solution=self.keep_last_solution,
             )
+            self.planning_horizon = int(planning_horizon)
 
         self.optimizer.reset()
         self._action_cache = None
         self._action_cache_idx = 0
+        self._replan_cache_len = 0
+        self.replan_skips = 0
+        self.last_plan_model_steps_est = 0
         self.last_plan_time = 0.0
         self.last_plan_debug = None
-        self.planned_this_step = False
-        self._plan_eval_calls = 0
-        self._plan_eval_sequences = 0
-        self._plan_rollouts_est = 0
 
     def act(
         self, obs: np.ndarray, optimizer_callback: OptimizerCallback = None, **_kwargs
@@ -1702,46 +1803,77 @@ class TrajectoryOptimizerAgent(Agent):
         if self.trajectory_eval_fn is None:
             raise RuntimeError("Please call `set_trajectory_eval_fn()` before using TrajectoryOptimizerAgent")
 
-        plan_time = 0.0
-        planned = False
-        if self._action_cache is None or self._action_cache_idx >= self._action_cache.shape[0]:
-            self._plan_eval_calls = 0
-            self._plan_eval_sequences = 0
-            self._plan_rollouts_est = 0
+        self.last_plan_model_steps_est = 0
 
+        def _ir_low_skip_ok() -> bool:
+            if not self.skip_replan_if_ir_low:
+                return False
+            dbg = self.last_plan_debug
+            if not isinstance(dbg, dict):
+                return False
+            ir_norm = dbg.get("ir_norm", None)
+            if ir_norm is None:
+                return False
+            try:
+                return float(ir_norm) <= float(self.skip_replan_ir_threshold)
+            except (TypeError, ValueError):
+                return False
+
+        plan_time = 0.0
+        if self._action_cache is not None and self._action_cache_idx >= self._replan_cache_len:
+            # At the nominal replan boundary: optionally skip replanning if IR indicates a
+            # stable/unimodal regime (e.g., BC-CEM).
+            if _ir_low_skip_ok() and self._action_cache_idx < self._action_cache.shape[0]:
+                max_len = int(self._action_cache.shape[0])
+                frac = float(getattr(self, "skip_replan_max_frac", 1.0))
+                if frac < 1.0:
+                    max_len = max(1, int(math.ceil(max_len * frac)))
+                rf = int(max(1, self.replan_freq))
+                max_len = max(max_len, rf)
+
+                new_len = min(
+                    int(self._action_cache.shape[0]),
+                    int(self._replan_cache_len) + rf,
+                    max_len,
+                )
+                if new_len > int(self._replan_cache_len):
+                    self._replan_cache_len = int(new_len)
+                    self.replan_skips += 1
+
+        need_replan = (
+            self._action_cache is None
+            or self._action_cache_idx >= self._action_cache.shape[0]
+            or self._action_cache_idx >= self._replan_cache_len
+        )
+        if need_replan:
             def trajectory_eval_fn(action_sequences):
                 return self.trajectory_eval_fn(obs, action_sequences)
 
             start_time = time.perf_counter()
             plan = self.optimizer.optimize(trajectory_eval_fn, callback=optimizer_callback)
             plan_time = time.perf_counter() - start_time
-            planned = True
             plan_debug = getattr(self.optimizer, "last_plan_debug", None)
-            if not isinstance(plan_debug, dict):
-                plan_debug = {}
-            else:
-                plan_debug = dict(plan_debug)
-            plan_debug.update(
-                {
-                    "eval_calls": int(self._plan_eval_calls),
-                    "eval_sequences": int(self._plan_eval_sequences),
-                    "rollouts_est": int(self._plan_rollouts_est),
-                }
-            )
-            self.last_plan_debug = plan_debug
+            self.last_plan_debug = plan_debug if isinstance(plan_debug, dict) else None
 
-            cache_len = int(min(int(self.replan_freq), int(plan.shape[0])))
-            self._action_cache = plan[:cache_len]
+            self._action_cache = plan
             self._action_cache_idx = 0
+            self._replan_cache_len = int(min(int(self.replan_freq), int(plan.shape[0])))
 
         # ``last_plan_time`` is the time spent on *this* step's planning (0.0 if no re-plan).
         self.last_plan_time = plan_time
-        self.planned_this_step = planned
-        action = self._action_cache[self._action_cache_idx]
-        self._action_cache_idx += 1
+        idx = int(self._action_cache_idx)
+        action = self._action_cache[idx]
+        self._action_cache_idx = idx + 1
+
+        # If we executed beyond the nominal warm-start shift window, advance the warm start.
+        rf = int(max(1, self.replan_freq))
+        if plan_time == 0.0 and idx >= rf:
+            self.optimizer.advance(1)
+
         if self._action_cache_idx >= self._action_cache.shape[0]:
             self._action_cache = None
             self._action_cache_idx = 0
+            self._replan_cache_len = 0
 
         if self.verbose:
             print(f"Planning time: {plan_time:.3f}")
@@ -1766,23 +1898,9 @@ class TrajectoryOptimizerAgent(Agent):
         def trajectory_eval_fn(action_sequences):
             return self.trajectory_eval_fn(obs, action_sequences)
 
-        self._plan_eval_calls = 0
-        self._plan_eval_sequences = 0
-        self._plan_rollouts_est = 0
         plan = self.optimizer.optimize(trajectory_eval_fn)
         plan_debug = getattr(self.optimizer, "last_plan_debug", None)
-        if not isinstance(plan_debug, dict):
-            plan_debug = {}
-        else:
-            plan_debug = dict(plan_debug)
-        plan_debug.update(
-            {
-                "eval_calls": int(self._plan_eval_calls),
-                "eval_sequences": int(self._plan_eval_sequences),
-                "rollouts_est": int(self._plan_rollouts_est),
-            }
-        )
-        self.last_plan_debug = plan_debug
+        self.last_plan_debug = plan_debug if isinstance(plan_debug, dict) else None
         return plan
 
 
@@ -1808,7 +1926,12 @@ def create_trajectory_optim_agent_for_model(
 
     """
     complete_agent_cfg(model_env, agent_cfg)
-    agent = hydra.utils.instantiate(agent_cfg, _recursive_=False)
+    try:
+        agent = hydra.utils.instantiate(agent_cfg, _recursive_=False)
+    except Exception as e:
+        if "_recursive_" not in str(e):
+            raise
+        agent = hydra.utils.instantiate(agent_cfg)
 
     eval_action_sequences = model_env.evaluate_action_sequences
 
@@ -1838,23 +1961,13 @@ def create_trajectory_optim_agent_for_model(
         except TypeError:
             return None
 
-    model_batch_divisor = _infer_model_batch_divisor()
-
     base_num_particles = int(num_particles)
-    # Expose base particle budget for downstream logging/debugging.
-    setattr(agent, "base_num_particles", base_num_particles)
-    setattr(agent, "last_particles_used", base_num_particles)
-
-    accounting_enabled = all(
-        hasattr(agent, k)
-        for k in ("_plan_eval_calls", "_plan_eval_sequences", "_plan_rollouts_est")
-    )
 
     def _pad_to_model_multiple(
         seqs: torch.Tensor, n_particles: int
     ) -> Tuple[torch.Tensor, int]:
         """Pads the batch so (B * n_particles) is divisible by #models (if required)."""
-        divisor = model_batch_divisor
+        divisor = _infer_model_batch_divisor()
         if not divisor:
             return seqs, 0
         B = int(seqs.shape[0])
@@ -1881,12 +1994,12 @@ def create_trajectory_optim_agent_for_model(
         want_var: bool,
     ):
         seqs_eval, pad_k = _pad_to_model_multiple(seqs, n_particles)
-        if accounting_enabled:
-            agent._plan_eval_calls += 1
-            agent._plan_eval_sequences += int(seqs_eval.shape[0])
-            agent._plan_rollouts_est += int(
-                seqs_eval.shape[0] * int(n_particles) * int(seqs_eval.shape[1])
+        try:
+            agent.last_plan_model_steps_est += int(seqs_eval.shape[0]) * int(n_particles) * int(
+                seqs_eval.shape[1]
             )
+        except Exception:
+            pass
 
         if want_var and supports_return_variance:
             out = eval_action_sequences(seqs_eval, initial_state=initial_state, num_particles=n_particles, return_variance=True)
@@ -1946,8 +2059,6 @@ def create_trajectory_optim_agent_for_model(
                 particles = int(round(p_min + t * (base_num_particles - p_min)))
                 particles = max(p_min, min(base_num_particles, particles))
 
-        setattr(agent, "last_particles_used", int(particles))
-
         # ---- risk + multi-fidelity knobs ----
         risk_coef = float(getattr(agent, "risk_spread_coef", 0.0))
         two_stage = bool(getattr(agent, "two_stage_eval", False))
@@ -1991,7 +2102,7 @@ def create_trajectory_optim_agent_for_model(
 
             # To avoid wasting compute on padding duplicates (for ensemble batch divisibility),
             # snap the refine batch size up to the next valid multiple when possible.
-            divisor = model_batch_divisor
+            divisor = _infer_model_batch_divisor()
             if divisor:
                 step = int(divisor) // max(1, math.gcd(int(divisor), int(particles)))
                 if step > 1:

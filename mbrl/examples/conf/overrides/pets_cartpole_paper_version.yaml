@@ -22,5 +22,8 @@ planning_horizon: 30
 cem_num_iters: 5
 cem_elite_ratio: 0.1
 cem_population_size: 500
+cem_population_size_per_worker: ${cem_population_size}
+cem_num_workers: 1
 cem_alpha: 0.1
 cem_clipped_normal: false
+cem_init_jitter_scale: 0.0

@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 import os
+import sys
 from typing import Optional
 
 import gymnasium as gym
@@ -31,6 +32,8 @@ def train(
 ) -> np.float32:
     # ------------------- Initialization -------------------
     debug_mode = cfg.get("debug_mode", False)
+    use_color = (not os.environ.get("NO_COLOR")) and bool(getattr(sys.stderr, "isatty", lambda: False)())
+    warning_tag = "\033[33m[BCCEM]\033[0m" if use_color else "[BCCEM]"
 
     obs_shape = env.observation_space.shape
     act_shape = env.action_space.shape
@@ -92,7 +95,6 @@ def train(
     # ---------------------------------------------------------
     # --------------------- Training Loop ---------------------
     env_steps = 0
-    current_trial = 0
     max_total_reward = -np.inf
     while env_steps < cfg.overrides.num_steps:
         obs, _ = env.reset()
@@ -101,6 +103,13 @@ def train(
         truncated = False
         total_reward = 0.0
         plan_time_sum = 0.0
+        model_steps_sum = 0
+        replan_calls = 0
+        centroid_action_steps = 0
+        bccem_ir_norm_sum = 0.0
+        bccem_ir_norm_count = 0
+        bccem_ir_norm_min = None
+        bccem_ir_norm_max = None
         steps_trial = 0
         while not terminated and not truncated:
             # --------------- Model Training -----------------
@@ -111,7 +120,26 @@ def train(
                     cfg.overrides,
                     replay_buffer,
                     work_dir=work_dir,
+                    silent=bool(cfg.algorithm.get("silent_model_train", False)),
                 )
+
+            # --- Optional BC-CEM schedule: anneal ir_high toward target over training steps ---
+            opt = getattr(getattr(agent, "optimizer", None), "optimizer", None)
+            bcem_params = getattr(opt, "bcem_params", None)
+            if bcem_params is not None:
+                target = getattr(bcem_params, "ir_high_target", None)
+                if target is not None:
+                    try:
+                        total_steps = int(getattr(cfg.overrides, "num_steps", 0))
+                    except (TypeError, ValueError):
+                        total_steps = 0
+                    if total_steps > 0:
+                        denom = max(1, total_steps - 1)
+                        t = float(env_steps) / float(denom)
+                        t = max(0.0, min(1.0, t))
+                        start = float(getattr(opt, "_ir_high_start", bcem_params.ir_high))
+                        # TODO: try cosine annealing?
+                        bcem_params.ir_high = start + t * (float(target) - start)
 
             # --- Doing env step using the agent and adding to model dataset ---
             (
@@ -128,26 +156,82 @@ def train(
             total_reward += reward
             steps_trial += 1
             env_steps += 1
-            plan_time_sum += getattr(agent, "last_plan_time", 0.0)
+            last_plan_time = float(getattr(agent, "last_plan_time", 0.0))
+            plan_time_sum += last_plan_time
+            model_steps_sum += int(getattr(agent, "last_plan_model_steps_est", 0))
+            dbg = getattr(agent, "last_plan_debug", None)
+            if isinstance(dbg, dict):
+                if dbg.get("exec_source", None) == "centroid":
+                    centroid_action_steps += 1
+                if last_plan_time > 0.0:
+                    replan_calls += 1
+                    ir_norm = dbg.get("ir_norm", None)
+                    if ir_norm is not None:
+                        # ---- BC-CEM specific logging and reset ----
+                        try:
+                            ir_v = float(ir_norm)
+                            bccem_ir_norm_sum += ir_v
+                            bccem_ir_norm_count += 1
+                            bccem_ir_norm_min = (
+                                ir_v
+                                if bccem_ir_norm_min is None
+                                else min(bccem_ir_norm_min, ir_v)
+                            )
+                            bccem_ir_norm_max = (
+                                ir_v
+                                if bccem_ir_norm_max is None
+                                else max(bccem_ir_norm_max, ir_v)
+                            )
+                            if debug_mode:
+                                print(f"{warning_tag} step {env_steps} | return {total_reward:.3f} | ir_norm {ir_v:.3f} | source {dbg.get('exec_source', 'N/A')}")
 
-            if debug_mode:
-                print(f"Step {env_steps}: Reward {reward:.3f}.")
+                        except (TypeError, ValueError):
+                            pass
 
+        skips = int(getattr(agent, "replan_skips", 0))
         if logger is not None:
+            centroid_frac = float(centroid_action_steps) / float(max(1, steps_trial))
+            ir_norm_mean = (
+                float(bccem_ir_norm_sum) / float(bccem_ir_norm_count)
+                if bccem_ir_norm_count
+                else float("nan")
+            )
             logger.log_data(
                 mbrl.constants.RESULTS_LOG_NAME,
                 {
                     "env_step": env_steps,
                     "episode_reward": total_reward,
                     "planning_time_ms": 1000.0
-                    * plan_time_sum
-                    / max(1, steps_trial),
+                    * plan_time_sum / max(1, steps_trial),
+                    "planning_model_steps_est": float(model_steps_sum) / max(1, steps_trial),
+                    "planning_replans": float(replan_calls),
+                    "planning_replans_per_step": float(replan_calls)
+                    / float(max(1, steps_trial)),
+                    "planning_skips": float(skips),
+                    "planning_skips_per_step": float(skips) / float(max(1, steps_trial)),
+                    "planning_centroid_frac": centroid_frac,
+                    "planning_ir_norm_mean": ir_norm_mean,
+                    "planning_ir_norm_min": float(bccem_ir_norm_min)
+                    if bccem_ir_norm_min is not None
+                    else float("nan"),
+                    "planning_ir_norm_max": float(bccem_ir_norm_max)
+                    if bccem_ir_norm_max is not None
+                    else float("nan"),
                 },
             )
-        current_trial += 1
-        if debug_mode:
-            print(f"Trial: {current_trial }, reward: {total_reward}.")
-
+        if cfg.algorithm.get("print_planning_info", False):
+            opt = getattr(getattr(agent, "optimizer", None), "optimizer", None)
+            opt_name = type(opt).__name__ if opt is not None else type(agent).__name__
+            msg = f"[planning] opt={opt_name} replans={replan_calls} skips={skips}"
+            if bccem_ir_norm_count:
+                msg += f" ir_mean={bccem_ir_norm_sum / float(bccem_ir_norm_count):.3f}"
+            if bccem_ir_norm_min is not None:
+                msg += f" ir_min={float(bccem_ir_norm_min):.3f}"
+            if bccem_ir_norm_max is not None:
+                msg += f" ir_max={float(bccem_ir_norm_max):.3f}"
+            if steps_trial:
+                msg += f" centroid_frac={centroid_action_steps / float(steps_trial):.3f}"
+            print(msg)
         max_total_reward = max(max_total_reward, total_reward)
 
     return np.float32(max_total_reward)

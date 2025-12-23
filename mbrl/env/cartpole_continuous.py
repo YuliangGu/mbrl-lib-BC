@@ -11,7 +11,7 @@ class CartPoleEnv(gym.Env):
     # This is a continuous version of gym's cartpole environment, with the only difference
     # being valid actions are any numbers in the range [-1, 1], and the are applied as
     # a multiplicative factor to the total force.
-    metadata = {"render.modes": ["human", "rgb_array"], "video.frames_per_second": [50]}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 50}
 
     def __init__(self, render_mode: Optional[str] = None):
         self.gravity = 9.8
@@ -116,13 +116,13 @@ class CartPoleEnv(gym.Env):
 
         return np.array(self.state), reward, terminated, False, {}
 
-    def reset(self, seed: Optional[int] = None):
-        super().reset(seed=seed)
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        super().reset(seed=seed, options=options)
         self.state = self.np_random.uniform(low=-0.05, high=0.05, size=(4,))
         self.steps_beyond_terminated = None
         if self.render_mode == "human":
             self.render()
-        return np.array(self.state), {}
+        return np.array(self.state, dtype=np.float32), {}
 
     def render(self):
         if self.render_mode is None:

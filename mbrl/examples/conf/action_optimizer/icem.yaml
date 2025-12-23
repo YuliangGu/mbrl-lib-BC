@@ -8,6 +8,7 @@ population_decay_factor: ${overrides.cem_population_decay_factor}
 colored_noise_exponent: ${overrides.cem_colored_noise_exponent}
 keep_elite_frac: ${overrides.cem_keep_elite_frac}
 alpha: ${overrides.cem_alpha}
+init_jitter_scale: ${overrides.cem_init_jitter_scale}
 lower_bound: ???
 upper_bound: ???
 return_mean_elites: true

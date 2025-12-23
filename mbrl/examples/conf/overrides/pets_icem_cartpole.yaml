@@ -17,7 +17,10 @@ planning_horizon: 10
 cem_num_iters: 5
 cem_elite_ratio: 0.1
 cem_population_size: 200
+cem_population_size_per_worker: ${cem_population_size}
+cem_num_workers: 1
 cem_population_decay_factor: 1.3
 cem_colored_noise_exponent: 2
 cem_keep_elite_frac: 0.3
 cem_alpha: 0.1
+cem_init_jitter_scale: 0.0

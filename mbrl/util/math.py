@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 import pathlib
 import pickle
+import math
 from typing import Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -64,6 +65,63 @@ def gaussian_nll(
     return losses
 
 
+
+""" 2025-12: optimized this function because it sits on the path for action sampling
+    (e.g., CEM with truncated normal). The previous Python while-loop version can
+    be very slow on CUDA since `.item()` introduces a device sync on every iteration.
+"""
+# def truncated_normal_(
+#     tensor: torch.Tensor, mean: float = 0, std: float = 1
+# ) -> torch.Tensor:
+#     """Samples from a truncated normal distribution in-place.
+
+#     Values are drawn from ``Normal(mean, std)`` and re-sampled until they fall within
+#     ``[mean - 2 * std, mean + 2 * std]``.
+
+#     Args:
+#         tensor (tensor): the tensor in which sampled values will be stored.
+#         mean (float): the desired mean (default = 0).
+#         std (float): the desired standard deviation (default = 1).
+
+#     Returns:
+#         (tensor): the tensor with the stored values. Note that this modifies the input tensor
+#             in place, so this is just a pointer to the same object.
+#     """
+#     if tensor.numel() == 0:
+#         return tensor
+#     if not tensor.is_floating_point():
+#         raise TypeError("truncated_normal_ expects a floating point tensor.")
+
+#     # Fast path: use PyTorch's built-in implementation when available.
+#     # This is vectorized and avoids Python-level rejection loops / GPU syncs.
+#     trunc_normal = getattr(torch.nn.init, "trunc_normal_", None)
+#     if trunc_normal is not None:
+#         a = mean - 2.0 * std
+#         b = mean + 2.0 * std
+#         return trunc_normal(tensor, mean=float(mean), std=float(std), a=float(a), b=float(b))
+
+#     # Fallback (older PyTorch): inverse-CDF sampling for a 2-sigma truncated normal.
+#     # Φ(x) = 0.5 * (1 + erf(x / sqrt(2)))  =>  Φ^{-1}(u) = sqrt(2) * erfinv(2u - 1)
+#     calc_dtype = tensor.dtype
+#     if calc_dtype in (torch.float16, torch.bfloat16):
+#         calc_dtype = torch.float32
+
+#     sqrt2 = math.sqrt(2.0)
+#     lower = 0.5 * (1.0 + math.erf(-2.0 / sqrt2))
+#     upper = 0.5 * (1.0 + math.erf(2.0 / sqrt2))
+
+#     u = torch.empty_like(tensor, dtype=calc_dtype).uniform_(lower, upper)
+#     z = sqrt2 * torch.erfinv(2.0 * u - 1.0)
+#     out = z * float(std) + float(mean)
+#     tensor.copy_(out.to(dtype=tensor.dtype))
+#     return tensor
+
+
+# ---- Legacy implementation (kept for reference) ----
+# In-place truncated normal sampling.
+# Original implementation (rejection sampling loop) was adapted from:
+#   https://github.com/Xingyu-Lin/mbpo_pytorch/blob/main/model.py#L64
+#
 # inplace truncated normal function for pytorch.
 # credit to https://github.com/Xingyu-Lin/mbpo_pytorch/blob/main/model.py#L64
 def truncated_normal_(
@@ -348,6 +406,10 @@ def powerlaw_psd_gaussian(
 
     # The number of samples in each time series
     samples = size[-1]
+
+    # Degenerate horizon (e.g., H=1) yields an empty spectrum; fall back to white noise.
+    if samples <= 1:
+        return torch.randn(tuple(size), device=device)
 
     # Calculate Frequencies (we assume a sample rate of one)
     # Use fft functions for real output (-> hermitian spectrum)

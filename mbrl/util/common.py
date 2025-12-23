@@ -84,8 +84,18 @@ def create_one_dim_tr_model(
     if model_cfg.get("out_size", None) is None:
         model_cfg.out_size = obs_shape[0] + int(cfg.algorithm.learned_rewards)
 
-    # Now instantiate the model
-    model = hydra.utils.instantiate(cfg.dynamics_model)
+    # Now instantiate the model.
+    #
+    # Many model classes in this repo expect some nested configs (e.g., activation_fn_cfg,
+    # BasicEnsemble.member_cfg) to be passed through as DictConfig objects and handle
+    # instantiation internally. Newer Hydra versions support a `_recursive_` kwarg to
+    # prevent eager instantiation of nested targets; Hydra 1.0.x does not.
+    try:
+        model = hydra.utils.instantiate(cfg.dynamics_model, _recursive_=False)
+    except Exception as e:
+        if "_recursive_" not in str(e):
+            raise
+        model = hydra.utils.instantiate(cfg.dynamics_model)
 
     name_obs_process_fn = cfg.overrides.get("obs_process_fn", None)
     if name_obs_process_fn:
@@ -366,6 +376,8 @@ def train_model_and_save_model_and_data(
     replay_buffer: ReplayBuffer,
     work_dir: Optional[Union[str, pathlib.Path]] = None,
     callback: Optional[Callable] = None,
+    *,
+    silent: bool = False,
 ):
     """Convenience function for training a model and saving results.
 
@@ -407,6 +419,7 @@ def train_model_and_save_model_and_data(
         patience=cfg.get("patience", 1),
         improvement_threshold=cfg.get("improvement_threshold", 0.01),
         callback=callback,
+        silent=silent,
     )
     if work_dir is not None:
         model.save(str(work_dir))

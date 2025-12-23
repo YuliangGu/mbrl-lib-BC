@@ -147,6 +147,7 @@ class ModelEnv:
         action_sequences: torch.Tensor,
         initial_state: np.ndarray,
         num_particles: int,
+        return_variance: bool = False,
     ) -> torch.Tensor:
         """Evaluates a batch of action sequences on the model.
 
@@ -157,10 +158,13 @@ class ModelEnv:
             initial_state (np.ndarray): the initial state for the trajectories.
             num_particles (int): number of times each action sequence is replicated. The final
                 value of the sequence will be the average over its particles values.
+            return_variance (bool): if True, also returns the variance across particles for
+                each action sequence.
 
         Returns:
-            (torch.Tensor): the accumulated reward for each action sequence, averaged over its
-            particles.
+            (torch.Tensor) or tuple(torch.Tensor, torch.Tensor): the accumulated reward for each
+            action sequence, averaged over its particles. If ``return_variance=True``, also returns
+            the variance across particles for each sequence.
         """
         with torch.no_grad():
             assert len(action_sequences.shape) == 3
@@ -188,4 +192,8 @@ class ModelEnv:
                 total_rewards += rewards
 
             total_rewards = total_rewards.reshape(-1, num_particles)
-            return total_rewards.mean(dim=1)
+            means = total_rewards.mean(dim=1)
+            if return_variance:
+                variances = total_rewards.var(dim=1, unbiased=False)
+                return means, variances
+            return means

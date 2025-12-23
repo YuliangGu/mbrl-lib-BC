@@ -1,14 +1,19 @@
 # @package _group_
 name: "pets"
 
+silent_model_train: false
+print_planning_info: false
+
 agent:
   _target_: mbrl.planning.TrajectoryOptimizerAgent
   action_lb: ???
   action_ub: ???
   planning_horizon: ${overrides.planning_horizon}
   optimizer_cfg: ${action_optimizer}
-  replan_freq: 2
+  replan_freq: 1
   verbose: ${debug_mode}
+  skip_replan_if_ir_low: false
+  skip_replan_ir_threshold: 0.1
 
 normalize: true
 normalize_double_precision: true
