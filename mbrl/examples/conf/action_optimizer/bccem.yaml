@@ -26,6 +26,7 @@ use_value_weights: true
 ir_low: 0.3
 ir_high: 0.5
 ir_high_target: 0.8
+ir_ema_alpha: 0.1
 
 # Early stopping.
 early_stop: true
