@@ -1,0 +1,48 @@
+# @package _group_
+env: "dmcontrol_ball_in_cup_catch"
+
+env_cfg:
+  _target_: "mbrl.util.dmcontrol.make_dmcontrol_env"
+  domain_name: "ball_in_cup"
+  task_name: "catch"
+  seed: ${seed}
+  visualize_reward: false
+  from_pixels: false
+  frame_skip: 6
+  episode_length: 1000
+
+term_fn: "no_termination"
+learned_rewards: true
+
+trial_length: 167
+num_steps: 50000
+
+num_elites: 5
+model_lr: 3.0e-4
+model_wd: 1.0e-4
+model_batch_size: 256
+validation_ratio: 0.1
+freq_train_model: 250
+patience: 25
+num_epochs_train_model: 25
+
+# Catching benefits from seeing ball-cup dynamics a bit further out.
+planning_horizon: 20
+cem_num_iters: 10
+cem_elite_ratio: 0.1
+cem_population_size: 1000
+cem_population_size_per_worker: ${cem_population_size}
+cem_num_workers: 1
+cem_alpha: 0.0
+cem_clipped_normal: true
+cem_init_jitter_scale: 0.0
+
+# BC-CEM defaults (used when action_optimizer=bccem).
+cem_consensus_coef: 0.25
+cem_consensus_anneal_power: 0.75
+cem_use_value_weights: true
+cem_ir_low: 0.3
+cem_ir_high: 0.5
+cem_early_stop: true
+cem_early_stop_mu: 1e-3
+cem_early_stop_patience: 2

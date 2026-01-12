@@ -97,7 +97,7 @@ def benchmark(
     init_jitter_scale = 0.1 * (UPPER - LOWER)
     num_workers = 5 
     num_iters = 5
-    per_iter_budget = 350 # total samples evaluated per iteration for fairness
+    per_iter_budget = 400 # total samples evaluated per iteration for fairness
 
     factories = {
         "CEM": lambda: planning.CEMOptimizer(
@@ -122,19 +122,22 @@ def benchmark(
             return_mean_elites=True,
             init_jitter_scale=init_jitter_scale,
         ),
-        "BCCEM": lambda: planning.BCCEMOptimizer(
-            num_iterations=num_iters,
-            elite_ratio=0.2,
-            population_size=per_iter_budget // num_workers,
-            alpha=0.2,
-            lower_bound=lower,
-            upper_bound=upper,
-            num_workers=num_workers,
-            device=device,
-            return_mean_elites=True,
-            init_jitter_scale=init_jitter_scale,
-            consensus_coef=0.5,
-        ),
+	        "BCCEM": lambda: planning.BCCEMOptimizer(
+	            num_iterations=num_iters,
+	            elite_ratio=0.2,
+	            population_size=per_iter_budget // num_workers,
+	            alpha=0.2,
+	            lower_bound=lower,
+	            upper_bound=upper,
+	            num_workers=num_workers,
+	            device=device,
+	            return_mean_elites=True,
+	            init_jitter_scale=init_jitter_scale,
+	            consensus_coef=0.75,
+	            consensus_anneal_power=0.2,
+	            early_stop_mu=1e-3,
+	            early_stop_patience=1,
+	        ),
         "iCEM": lambda: planning.ICEMOptimizer(
             num_iterations=num_iters,
             elite_ratio=0.2,
@@ -165,10 +168,10 @@ def benchmark(
             num_iterations=num_iters,
             population_size=per_iter_budget,
             elite_ratio=0.2,
-            sigma=0.5 * (UPPER - LOWER),
+            sigma=0.1 * (UPPER - LOWER),
             lower_bound=lower,
             upper_bound=upper,
-            alpha=0.3,
+            alpha=0.2,
             device=device,
             adaptation="full",
             return_mean_elites=True,

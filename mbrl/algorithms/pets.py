@@ -21,10 +21,6 @@ import mbrl.util.math
 
 EVAL_LOG_FORMAT = mbrl.constants.EVAL_LOG_FORMAT
 IR_MEAN_EMA_ALPHA = 0.9
-META_COPY_EMA_ALPHA = 0.99
-DISTILL_BATCH_SIZE = 256
-
-# TODO: for the ensemble growth, only keeps meta-copy and random init strategies. remove others and related.
 
 def train(
     env: gym.Env,
@@ -93,86 +89,6 @@ def train(
     opt = getattr(getattr(agent, "optimizer", None), "optimizer", None)
     is_bccem = type(opt).__name__ == "BCCEMOptimizer"
 
-    # ---------------------------------------------------------
-    # ---- Optional BC-CEM ensemble growth (speed-up early) ----
-    ensemble_grow_cfg = cfg.algorithm.get("ensemble_grow", None)
-    ensemble_grow_enabled_cfg = (
-        None if ensemble_grow_cfg is None else ensemble_grow_cfg.get("enabled", None)
-    )
-    ensemble_grow_enabled = (
-        bool(is_bccem)
-        if ensemble_grow_enabled_cfg is None
-        else bool(ensemble_grow_enabled_cfg)
-    )
-
-    ensemble_size_max = int(len(dynamics_model))
-    if ensemble_grow_enabled and is_bccem:
-        if ensemble_grow_cfg is None:
-            init_size = min(2, ensemble_size_max)
-        else:
-            init_size = int(ensemble_grow_cfg.get("init_size", min(2, ensemble_size_max)))
-            max_size_cfg = ensemble_grow_cfg.get("max_size", None)
-            if max_size_cfg is not None:
-                ensemble_size_max = int(max_size_cfg)
-        init_size = max(1, min(init_size, ensemble_size_max))
-
-        if init_size < len(dynamics_model):
-            base_model = getattr(dynamics_model, "model", None)
-            resize_fn = getattr(base_model, "resize_ensemble", None)
-            if callable(resize_fn):
-                resize_fn(init_size)
-                if debug_mode:
-                    print(
-                        f"{warning_tag} ensemble_grow init: {len(dynamics_model)}/{ensemble_size_max}"
-                    )
-            else:
-                ensemble_grow_enabled = False
-                if debug_mode:
-                    print(
-                        f"{warning_tag} ensemble_grow disabled (model has no resize_ensemble)."
-                    )
-
-    # Cache growth init settings (also used for meta_copy EMA candidate prep).
-    ensemble_grow_init_strategy = None
-    ensemble_grow_meta_member_idx = None
-    ensemble_grow_init_noise_std = None
-    ensemble_grow_meta_copy_ema_alpha = None
-    ensemble_grow_meta_copy_candidate = False
-    if ensemble_grow_enabled and is_bccem:
-        ensemble_grow_init_strategy = (
-            "meta_copy"
-            if ensemble_grow_cfg is None
-            else str(ensemble_grow_cfg.get("init_strategy", "meta_copy"))
-        )
-        init_strategy_norm = str(ensemble_grow_init_strategy).lower()
-        ensemble_grow_meta_copy_candidate = init_strategy_norm in {
-            "meta_copy",
-            "copy",
-            "meta",
-            "inherit",
-        }
-        ensemble_grow_meta_member_idx = (
-            0
-            if ensemble_grow_cfg is None
-            else int(ensemble_grow_cfg.get("meta_member_idx", 0))
-        )
-        ensemble_grow_init_noise_std = (
-            0.0
-            if ensemble_grow_cfg is None
-            else float(ensemble_grow_cfg.get("init_noise_std", 0.0))
-        )
-        ensemble_grow_meta_copy_ema_alpha = (
-            float(META_COPY_EMA_ALPHA)
-            if ensemble_grow_cfg is None
-            else float(ensemble_grow_cfg.get("meta_copy_ema_alpha", META_COPY_EMA_ALPHA))
-        )
-
-    if is_bccem:
-        if ensemble_grow_meta_member_idx is None:
-            ensemble_grow_meta_member_idx = 0
-        if ensemble_grow_meta_copy_ema_alpha is None:
-            ensemble_grow_meta_copy_ema_alpha = float(META_COPY_EMA_ALPHA)
-
     model_trainer = mbrl.models.ModelTrainer(
         dynamics_model,
         optim_lr=cfg.overrides.model_lr,
@@ -180,28 +96,11 @@ def train(
         logger=logger,
     )
 
-    # Prepare on-hold candidate for meta_copy growth (kept updated after each model training).
-    if is_bccem:
-        base_model = getattr(dynamics_model, "model", None)
-        update_cand_fn = getattr(base_model, "update_meta_copy_candidate", None)
-        if callable(update_cand_fn):
-            update_cand_fn(
-                meta_member_idx=int(ensemble_grow_meta_member_idx),
-                ema_alpha=float(ensemble_grow_meta_copy_ema_alpha),
-            )
-
     # ---------------------------------------------------------
     # --------------------- Training Loop ---------------------
     env_steps = 0
     max_total_reward = -np.inf
     bccem_ir_norm_mean_ema = None
-    bccem_ir_norm_mean_ema_prev = None
-    bccem_ir_ema_stable = 0
-    episode_reward_ema = None
-    episode_reward_ema_prev = None
-    episode_reward_ema_stable = 0
-    last_grow_episode = -10**9
-    dynamics_distill_mse = float("nan")
     episode_idx = 0
     while env_steps < cfg.overrides.num_steps:
         episode_idx += 1
@@ -209,7 +108,6 @@ def train(
         agent.reset()
         terminated = False
         truncated = False
-        grew_this_episode = 0.0
         total_reward = 0.0
         plan_time_sum = 0.0
         model_steps_sum = 0
@@ -217,8 +115,10 @@ def train(
         centroid_action_steps = 0
         bccem_ir_norm_sum = 0.0
         bccem_ir_norm_count = 0
-        bccem_ir_norm_min = None
-        bccem_ir_norm_max = None
+        bccem_ir_low_sum = 0.0
+        bccem_ir_low_count = 0
+        bccem_ir_high_sum = 0.0
+        bccem_ir_high_count = 0
         pred_cv_sum = 0.0
         pred_cv_count = 0
         steps_trial = 0
@@ -233,51 +133,6 @@ def train(
                     work_dir=work_dir,
                     silent=bool(cfg.algorithm.get("silent_model_train", False)),
                 )
-                if is_bccem:
-                    base_model = getattr(dynamics_model, "model", None)
-                    update_cand_fn = getattr(base_model, "update_meta_copy_candidate", None)
-                    if callable(update_cand_fn):
-                        update_cand_fn(
-                            meta_member_idx=int(ensemble_grow_meta_member_idx),
-                            ema_alpha=float(ensemble_grow_meta_copy_ema_alpha),
-                        )
-                    distill_fn = getattr(base_model, "meta_copy_distillation_score", None)
-                    if callable(distill_fn) and hasattr(dynamics_model, "_get_model_input"):
-                        try:
-                            distill_bs = int(
-                                getattr(
-                                    cfg.overrides,
-                                    "model_batch_size",
-                                    int(DISTILL_BATCH_SIZE),
-                                )
-                            )
-                            distill_bs = max(1, min(int(DISTILL_BATCH_SIZE), distill_bs))
-                            batch = replay_buffer.sample(distill_bs)
-                            model_in = dynamics_model._get_model_input(batch.obs, batch.act)
-                            dynamics_distill_mse = float(distill_fn(model_in))
-                            if debug_mode:
-                                print(
-                                    f"{warning_tag} distill_mse {dynamics_distill_mse:.3g}"
-                                )
-                        except Exception:
-                            dynamics_distill_mse = float("nan")
-
-            # --- Optional BC-CEM schedule: anneal ir_high toward target over training steps ---
-            opt = getattr(getattr(agent, "optimizer", None), "optimizer", None)
-            target = getattr(opt, "ir_high_target", None)
-            if target is not None:
-                try:
-                    total_steps = int(getattr(cfg.overrides, "num_steps", 0))
-                except (TypeError, ValueError):
-                    total_steps = 0
-                if total_steps > 0:
-                    denom = max(1, total_steps - 1)
-                    t = float(env_steps) / float(denom)
-                    t = max(0.0, min(1.0, t))
-                    ir_high = getattr(opt, "ir_high", None)
-                    if ir_high is not None:
-                        start = float(getattr(opt, "_ir_high_start", ir_high))
-                        opt.ir_high = start + t * (float(target) - start)
 
             # --- Doing env step using the agent and adding to model dataset ---
             (
@@ -314,6 +169,26 @@ def train(
                         except (TypeError, ValueError):
                             pred_cv_v = None
 
+                    ir_low = dbg.get("ir_low", None)
+                    if ir_low is not None:
+                        try:
+                            v = float(ir_low)
+                            if np.isfinite(v):
+                                bccem_ir_low_sum += v
+                                bccem_ir_low_count += 1
+                        except (TypeError, ValueError):
+                            pass
+
+                    ir_high = dbg.get("ir_high", None)
+                    if ir_high is not None:
+                        try:
+                            v = float(ir_high)
+                            if np.isfinite(v):
+                                bccem_ir_high_sum += v
+                                bccem_ir_high_count += 1
+                        except (TypeError, ValueError):
+                            pass
+
                     ir_norm = dbg.get("ir_norm", None)
                     if ir_norm is not None:
                         # ---- BC-CEM specific logging and reset ----
@@ -321,16 +196,6 @@ def train(
                             ir_v = float(ir_norm)
                             bccem_ir_norm_sum += ir_v
                             bccem_ir_norm_count += 1
-                            bccem_ir_norm_min = (
-                                ir_v
-                                if bccem_ir_norm_min is None
-                                else min(bccem_ir_norm_min, ir_v)
-                            )
-                            bccem_ir_norm_max = (
-                                ir_v
-                                if bccem_ir_norm_max is None
-                                else max(bccem_ir_norm_max, ir_v)
-                            )
                             if debug_mode:
                                 cv_msg = (
                                     f" | pred_cv {pred_cv_v:.3g}"
@@ -338,7 +203,7 @@ def train(
                                     else ""
                                 )
                                 print(
-                                    f"{warning_tag} step {env_steps} | return {total_reward:.3f} | ir_norm {ir_v:.3f}{cv_msg} | source {dbg.get('exec_source', 'N/A')}"
+                                    f"{warning_tag} step {env_steps} | return {total_reward:.2f} | ir_norm {ir_v:.3f}{cv_msg} | source {dbg.get('exec_source', 'N/A')}"
                                 )
 
                         except (TypeError, ValueError):
@@ -365,115 +230,29 @@ def train(
             if pred_cv_count
             else float("nan")
         )
-
-        # Track episode return EMA for ensemble growth (stagnation signal).
-        if episode_reward_ema is None:
-            episode_reward_ema = float(total_reward)
-        else:
-            return_ema_alpha = (
-                0.9
-                if ensemble_grow_cfg is None
-                else float(ensemble_grow_cfg.get("return_ema_alpha", 0.9))
-            )
-            return_ema_alpha = max(0.0, min(1.0, return_ema_alpha))
-            episode_reward_ema = (
-                return_ema_alpha * float(episode_reward_ema)
-                + (1.0 - return_ema_alpha) * float(total_reward)
-            )
-
-        # ---- ensemble grow trigger (BC-CEM) ----
-        if ensemble_grow_enabled and is_bccem and (bccem_ir_norm_count > 0):
-            ema_abs_tol = 0.01 if ensemble_grow_cfg is None else float(
-                ensemble_grow_cfg.get("ema_abs_tol", 0.01)
-            )
-            ema_rel_tol = 0.02 if ensemble_grow_cfg is None else float(
-                ensemble_grow_cfg.get("ema_rel_tol", 0.02)
-            )
-            patience = 3 if ensemble_grow_cfg is None else int(
-                ensemble_grow_cfg.get("patience", 3)
-            )
-            warmup_episodes = 1 if ensemble_grow_cfg is None else int(
-                ensemble_grow_cfg.get("warmup_episodes", 1)
-            )
-            cooldown_episodes = 0 if ensemble_grow_cfg is None else int(
-                ensemble_grow_cfg.get("cooldown_episodes", 0)
-            )
-
-            if bccem_ir_norm_mean_ema_prev is not None and bccem_ir_norm_mean_ema is not None:
-                delta = abs(float(bccem_ir_norm_mean_ema) - float(bccem_ir_norm_mean_ema_prev))
-                rel = delta / (abs(float(bccem_ir_norm_mean_ema_prev)) + 1e-8)
-                if (delta <= ema_abs_tol) or (rel <= ema_rel_tol):
-                    bccem_ir_ema_stable += 1
-                else:
-                    bccem_ir_ema_stable = 0
-            bccem_ir_norm_mean_ema_prev = bccem_ir_norm_mean_ema
-
-            return_abs_tol = 0.5 if ensemble_grow_cfg is None else float(
-                ensemble_grow_cfg.get("return_ema_abs_tol", 0.5)
-            )
-            return_rel_tol = 0.01 if ensemble_grow_cfg is None else float(
-                ensemble_grow_cfg.get("return_ema_rel_tol", 0.01)
-            )
-            return_patience = patience if ensemble_grow_cfg is None else int(
-                ensemble_grow_cfg.get("return_patience", patience)
-            )
-            if episode_reward_ema_prev is not None and episode_reward_ema is not None:
-                delta_r = abs(float(episode_reward_ema) - float(episode_reward_ema_prev))
-                rel_r = delta_r / (abs(float(episode_reward_ema_prev)) + 1e-8)
-                if (delta_r <= return_abs_tol) or (rel_r <= return_rel_tol):
-                    episode_reward_ema_stable += 1
-                else:
-                    episode_reward_ema_stable = 0
-            episode_reward_ema_prev = episode_reward_ema
-
-            if (
-                episode_idx >= warmup_episodes
-                and bccem_ir_ema_stable >= max(1, patience)
-                and episode_reward_ema_stable >= max(1, return_patience)
-                and (episode_idx - last_grow_episode) >= max(0, cooldown_episodes)
-                and len(dynamics_model) < ensemble_size_max
-            ):
-                grow_step = 1 if ensemble_grow_cfg is None else int(
-                    ensemble_grow_cfg.get("grow_step", 1)
-                )
-                new_size = min(ensemble_size_max, int(len(dynamics_model)) + max(1, grow_step))
-
-                init_strategy = str(ensemble_grow_init_strategy)
-                meta_member_idx = int(ensemble_grow_meta_member_idx)
-                noise_std = float(ensemble_grow_init_noise_std)
-
-                base_model = getattr(dynamics_model, "model", None)
-                grow_fn = getattr(base_model, "grow_ensemble", None)
-                resize_fn = getattr(base_model, "resize_ensemble", None)
-                if callable(grow_fn):
-                    grow_fn(
-                        new_size,
-                        init_strategy=init_strategy,
-                        meta_member_idx=meta_member_idx,
-                        noise_std=noise_std,
-                    )
-                elif callable(resize_fn):
-                    resize_fn(new_size)
-                else:
-                    ensemble_grow_enabled = False
-
-                if ensemble_grow_enabled:
-                    model_trainer = mbrl.models.ModelTrainer(
-                        dynamics_model,
-                        optim_lr=cfg.overrides.model_lr,
-                        weight_decay=cfg.overrides.model_wd,
-                        logger=logger,
-                    )
-                    grew_this_episode = 1.0
-                    last_grow_episode = episode_idx
-                    bccem_ir_ema_stable = 0
-                    episode_reward_ema_stable = 0
-                    if debug_mode or cfg.algorithm.get("print_planning_info", False):
-                        print(
-                            f"{warning_tag} ensemble_grow: {len(dynamics_model)}/{ensemble_size_max}"
-                        )
+        ir_low_mean = (
+            float(bccem_ir_low_sum) / float(bccem_ir_low_count)
+            if bccem_ir_low_count
+            else float("nan")
+        )
+        ir_high_mean = (
+            float(bccem_ir_high_sum) / float(bccem_ir_high_count)
+            if bccem_ir_high_count
+            else float("nan")
+        )
 
         if logger is not None:
+            poplin_total = float("nan")
+            poplin_action = float("nan")
+            poplin_weights = float("nan")
+            poplin_losses = getattr(agent, "poplin_last_losses", None)
+            if poplin_losses is not None:
+                try:
+                    poplin_total = float(getattr(poplin_losses, "total", float("nan")))
+                    poplin_action = float(getattr(poplin_losses, "action", float("nan")))
+                    poplin_weights = float(getattr(poplin_losses, "weights", float("nan")))
+                except (TypeError, ValueError):
+                    pass
             logger.log_data(
                 mbrl.constants.RESULTS_LOG_NAME,
                 {
@@ -493,18 +272,11 @@ def train(
                     if bccem_ir_norm_mean_ema is not None
                     else float("nan"),
                     "planning_pred_return_cv_mean": pred_cv_mean,
-                    "episode_reward_ema": float(episode_reward_ema)
-                    if episode_reward_ema is not None
-                    else float("nan"),
-                    "dynamics_ensemble_size": float(len(dynamics_model)),
-                    "dynamics_ensemble_grew": float(grew_this_episode),
-                    "dynamics_distill_mse": float(dynamics_distill_mse),
-                    "planning_ir_norm_min": float(bccem_ir_norm_min)
-                    if bccem_ir_norm_min is not None
-                    else float("nan"),
-                    "planning_ir_norm_max": float(bccem_ir_norm_max)
-                    if bccem_ir_norm_max is not None
-                    else float("nan"),
+                    "planning_ir_low_mean": ir_low_mean,
+                    "planning_ir_high_mean": ir_high_mean,
+                    "poplin_policy_loss_total": poplin_total,
+                    "poplin_policy_loss_action": poplin_action,
+                    "poplin_policy_loss_weights": poplin_weights,
                 },
             )
         if cfg.algorithm.get("print_planning_info", False):
@@ -517,27 +289,8 @@ def train(
                     msg += f" ir_ema={bccem_ir_norm_mean_ema:.3f}"
             if pred_cv_count:
                 msg += f" pred_cv={pred_cv_mean:.3g}"
-            if ensemble_grow_enabled and is_bccem:
-                msg += f" ens={len(dynamics_model)}/{ensemble_size_max}"
-            if np.isfinite(float(dynamics_distill_mse)):
-                msg += f" distill_mse={float(dynamics_distill_mse):.3g}"
-            if bccem_ir_norm_min is not None:
-                msg += f" ir_min={float(bccem_ir_norm_min):.3f}"
-            if bccem_ir_norm_max is not None:
-                msg += f" ir_max={float(bccem_ir_norm_max):.3f}"
             if steps_trial:
                 msg += f" centroid_frac={centroid_action_steps / float(steps_trial):.3f}"
-            if ensemble_grow_enabled and is_bccem:
-                patience = 3 if ensemble_grow_cfg is None else int(ensemble_grow_cfg.get("patience", 3))
-                return_patience = (
-                    patience
-                    if ensemble_grow_cfg is None
-                    else int(ensemble_grow_cfg.get("return_patience", patience))
-                )
-                msg += (
-                    f" grow_ir={int(bccem_ir_ema_stable)}/{max(1, int(patience))}"
-                    f" grow_ret={int(episode_reward_ema_stable)}/{max(1, int(return_patience))}"
-                )
             print(msg)
         max_total_reward = max(max_total_reward, total_reward)
 

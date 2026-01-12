@@ -43,14 +43,12 @@ Note: the current per-worker consensus scaling is `beta_w = beta / (1 + kl_w / d
 - `return_mean_elites`: if `false`, returns the best sampled sequence (like standard CEM-family optimizers).
   If `true`, uses `ir_norm` to choose between returning the centroid mean vs. a worker mean sampled from the worker weights.
 - `ir_low` / `ir_high`: thresholds (on `ir_norm`) controlling the centroid-vs-worker decision when `return_mean_elites=true`.
-- `ir_high_target` (optional): if set, some training loops may anneal `ir_high` toward this target over total env steps (see below).
 
 Warm-start: `TrajectoryOptimizer` always warm-starts from the returned/executed sequence (shifted by `replan_freq`).
 
 ### Early stopping
 
-- `early_stop`: enables early stopping when both IR and centroid motion are small.
-- `early_stop_ir`: IR threshold for early-stop.
+ - `early_stop`: enables early stopping when centroid motion is small (and the centroid variance is not collapsed).
 - `early_stop_mu`: RMS centroid-mean change threshold for early-stop.
 - `early_stop_patience`: number of consecutive “small-change” iterations before stopping.
 
@@ -59,24 +57,9 @@ Warm-start: `TrajectoryOptimizer` always warm-starts from the returned/executed 
 - `TrajectoryOptimizer` instantiates the underlying optimizer via Hydra and calls `optimizer.optimize(..., x0=previous_solution)`.
 - `TrajectoryOptimizerAgent` plans an action sequence and caches it for `replan_freq` environment steps. The warm-start shift is handled in `TrajectoryOptimizer` when `keep_last_solution=true`.
 - If `skip_replan_if_ir_low=true`, `TrajectoryOptimizerAgent` can extend the cached plan (skip replanning) when `agent.last_plan_debug["ir_norm"] <= skip_replan_ir_threshold`.
-- If `particle_schedule="ir"` in the agent config, `create_trajectory_optim_agent_for_model()` adapts the model rollout particle count based on the *previous* plan’s `ir_norm` (using `ir_particles_low/high` and `particles_min_frac`).
+- If `particle_schedule="ir"` in the agent config, `create_trajectory_optim_agent_for_model()` may reduce model-rollout particles (down to `particles_min_frac`) when the *previous* plan indicates a stable/unimodal regime (`ir_norm <= ir_low`) and predicted-return CV is low.
 
-## Config grouping (`bcem_params`)
+## Config
 
-`BCCEMOptimizer` accepts either:
-
-- flat Hydra keys (e.g., `action_optimizer.ir_high=...`), or
-- a single `bcem_params: <BCCEMParams>` object (Hydra-instantiated dataclass; `BCCEMParams` lives at `mbrl.planning.trajectory_opt.BCCEMParams`).
-
-If `bcem_params` is provided, it takes precedence over the flat keys.
-
-Example (nested dataclass):
-
-```yaml
-_target_: mbrl.planning.BCCEMOptimizer
-bcem_params:
-  _target_: mbrl.planning.trajectory_opt.BCCEMParams
-  ir_low: 0.3
-  ir_high: 1.0
-  ir_high_target: 0.4
-```
+`BCCEMOptimizer` is configured entirely via flat Hydra keys (the arguments to
+`mbrl.planning.BCCEMOptimizer.__init__`).

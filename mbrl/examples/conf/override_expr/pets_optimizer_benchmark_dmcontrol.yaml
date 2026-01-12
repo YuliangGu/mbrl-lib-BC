@@ -1,29 +1,28 @@
 # @package _global_
-# Benchmark PETS with several trajectory optimizers under a shared planning budget.
+# Benchmark PETS with several trajectory optimizers on dm_control tasks.
 defaults:
   - override /algorithm: pets
-  - override /overrides: pets_cartpole
+  - override /overrides: dmc_cartpole_balance
   - override /dynamics_model: gaussian_mlp_ensemble
   - override /action_optimizer: cem
   - _self_
 
-experiment: pets_optimizer_benchmark
+experiment: pets_optimizer_benchmark_dmcontrol
 
 overrides:
   # Fairness: use the same samples / iteration and iterations across optimizers.
-  # Use a budget divisible by both num_elites (default PETS uses 5) and worker count (4).
-  planning_samples_per_iter: 360
+  planning_samples_per_iter: 500
   planning_num_iters: 5
 
   # Base CEM settings used by all CEM-family variants.
-  cem_num_workers: 4                    
-  cem_population_size_per_worker: 90 # 4 * 90 = 360 total samples (the original 350 budget, but divisible by 5 elites).
+  cem_num_workers: 4
+  cem_population_size_per_worker: 125
   cem_population_size: ${overrides.planning_samples_per_iter}
   cem_num_iters: ${overrides.planning_num_iters}
   cem_elite_ratio: 0.1
   cem_alpha: 0.1
   cem_clipped_normal: false
-  cem_init_jitter_scale: 0.3
+  cem_init_jitter_scale: 0.1
 
   # BCEM
   cem_consensus_coef: 0.25
@@ -68,26 +67,26 @@ overrides:
 algorithm:
   silent_model_train: true
   print_planning_info: true
-  num_particles: 20        
+  num_particles: 20
 
   agent:
     replan_freq: 1
     verbose: false
     keep_last_solution: true
 
-    # (NEW) two-stage evaluation settings
+    # two-stage evaluation settings
     two_stage_eval: true
-    two_stage_particles_frac: 0.5 # fraction of particles for first stage
-    two_stage_topk_frac: 0.2      # fraction of topk to carry to second stage 
-    two_stage_max_topk: 64        # max topk to carry to second stage
+    two_stage_particles_frac: 0.5
+    two_stage_topk_frac: 0.2
+    two_stage_max_topk: 64
     risk_spread_coef: 0.0
 
     # adaptive particle settings for BC-CEM
     particle_schedule: "ir"
-    particles_min_frac: 0.25     # min fraction of base particles
+    particles_min_frac: 0.25
     cv_low_threshold: 0.1
 
-    # replan skipping informed by BC-CEM's IR estimates. 
+    # replan skipping informed by BC-CEM's IR estimates.
     skip_replan_if_ir_low: true
     skip_replan_ir_threshold: 0.1
     skip_replan_max_frac: 0.25

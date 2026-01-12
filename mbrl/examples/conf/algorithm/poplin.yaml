@@ -1,0 +1,62 @@
+# @package _group_
+name: "poplin"
+
+silent_model_train: false
+print_planning_info: false
+
+agent:
+  _target_: mbrl.planning.PoplinTrajectoryOptimizerAgent
+  action_lb: ???
+  action_ub: ???
+  obs_dim: ???
+  planning_horizon: ${overrides.planning_horizon}
+  optimizer_cfg: ${action_optimizer}
+  replan_freq: 1
+  verbose: ${debug_mode}
+  skip_replan_if_ir_low: false
+  skip_replan_ir_threshold: 0.1
+
+  # ---- POPLIN ----
+  poplin:
+    enabled: true
+    variant: a                   # {a (action-space), p (parameter-space)}
+    num_heads: auto               # {auto, <int>}
+    use_policy_actions: true
+    use_policy_weights: true
+    warm_start_mode: auto         # {auto, multihead, centroid, wta}
+    warm_start_mix: 1.0
+
+    # Policy network
+    hidden_sizes: [256, 256] 
+    activation: relu
+
+    # Supervised training from optimizer targets
+    dataset_capacity: 100000
+    store_every: 1
+    train_every: 1
+    batch_size: 256
+    updates_per_train: 1
+    lr: 1e-3
+    weight_decay: 0.0
+    action_loss_coef: 1.0
+    weight_loss_coef: 1.0
+    weight_targets: soft          # {soft, hard}
+    action_loss_mode: null        # {null (legacy), uniform, weighted}
+    weight_temperature: 1.0
+    action_loss_weighted_by_targets: true
+
+    # ---- POPLIN-P (parameter-space planning) ----
+    # Used when variant=p. The sampling distribution is over flattened policy parameters.
+    param_lb: -1.0
+    param_ub: 1.0
+    param_avg_coef: 0.97           # Polyak/AVG update coefficient: 
+    param_return_mean_elites: true
+
+normalize: true
+normalize_double_precision: true
+target_is_delta: true
+initial_exploration_steps: ${overrides.trial_length}
+freq_train_model: ${overrides.freq_train_model}
+learned_rewards: ${overrides.learned_rewards}
+
+num_particles: 20

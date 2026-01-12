@@ -24,6 +24,8 @@ def _spec_to_box(spec):
         maxs.append(mx)
     low = np.concatenate(mins, axis=0)
     high = np.concatenate(maxs, axis=0)
+    low = low.astype(np.float32, copy=False)
+    high = high.astype(np.float32, copy=False)
     assert low.shape == high.shape
     return spaces.Box(low, high, dtype=np.float32)
 
@@ -112,6 +114,7 @@ class DMCWrapper(core.Env):
                 )
         else:
             obs = _flatten_obs(time_step.observation)
+            obs = obs.astype(np.float32, copy=False)
         return obs
 
     def _convert_action(self, action):
@@ -154,13 +157,13 @@ class DMCWrapper(core.Env):
             if done:
                 break
         obs = self._get_obs(time_step)
-        self.current_state = _flatten_obs(time_step.observation)
+        self.current_state = _flatten_obs(time_step.observation).astype(np.float32, copy=False)
         extra["discount"] = time_step.discount
         return obs, reward, done, extra
 
     def reset(self):
         time_step = self._env.reset()
-        self.current_state = _flatten_obs(time_step.observation)
+        self.current_state = _flatten_obs(time_step.observation).astype(np.float32, copy=False)
         obs = self._get_obs(time_step)
         return obs
 

@@ -51,6 +51,10 @@ def create_handler(cfg: Union[Dict, omegaconf.ListConfig, omegaconf.DictConfig])
         from mbrl.util.pybullet import PybulletEnvHandler
 
         return PybulletEnvHandler()
+    elif "dmcontrol" in target or "dmc2gym" in target:
+        from mbrl.util.dmcontrol import DmcontrolEnvHandler
+
+        return DmcontrolEnvHandler()
     elif "mujoco" in target:
         from mbrl.util.mujoco import MujocoEnvHandler
 

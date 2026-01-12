@@ -330,7 +330,10 @@ class DecentCEMOptimizer(Optimizer):
     def _init_population_params(
         self, x0: torch.Tensor, jitter_scale: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        mean = x0.expand((self.num_workers,) + x0.shape)
+        if x0.dim() == 3 and int(x0.shape[0]) == int(self.num_workers):
+            mean = x0.clone()
+        else:
+            mean = x0.expand((self.num_workers,) + x0.shape)
         if self._clipped_normal:
             dispersion = torch.ones_like(mean)
         else:
@@ -388,18 +391,26 @@ class DecentCEMOptimizer(Optimizer):
         callback: OptimizerCallback = None,
         **kwargs,
     ) -> torch.Tensor:
+        if x0 is None:
+            raise ValueError("DecentCEMOptimizer requires an initial solution x0.")
+        action_shape = tuple(x0.shape)
+        x0_like = x0
+        if x0.dim() == 3 and int(x0.shape[0]) == int(self.num_workers):
+            action_shape = tuple(x0.shape[1:])
+            x0_like = x0[0]
+
         mu, dispersion = self._init_population_params(x0, jitter_scale=self.init_jitter_scale)
-        best_solution = torch.empty_like(x0)
+        best_solution = torch.empty_like(x0_like)
         best_value = -float("inf")
         best_worker_idx = 0
         population = self._get_buffer(
             "population",
-            (self.num_workers, self.population_size) + tuple(x0.shape),
+            (self.num_workers, self.population_size) + tuple(action_shape),
             device=self.device,
         )
         for i in range(self.num_iterations):
             population = self._sample_population(mu, dispersion, population)
-            flat_population = population.reshape(-1, *x0.shape)
+            flat_population = population.reshape(-1, *action_shape)
             values = obj_fun(flat_population).reshape(
                 self.num_workers, self.population_size
             )
@@ -426,6 +437,18 @@ class DecentCEMOptimizer(Optimizer):
                     best_worker_idx, elite_idx[best_worker_idx, 0]
                 ].clone()
 
+        # Expose final worker distributions (useful for POPLIN-style distillation).
+        try:
+            self._last_mu_w = mu.detach().clone()
+            self._last_disp_w = dispersion.detach().clone()
+            scores = worker_best_values.detach()  # type: ignore[name-defined]
+            scores = scores - torch.max(scores)
+            weights = torch.softmax(scores, dim=0)
+            self._last_worker_weights = weights.detach().clone()
+            self._last_best_worker_idx = int(best_worker_idx)
+        except Exception:
+            pass
+
         if self.return_mean_elites:
             return mu[best_worker_idx]
         return best_solution
@@ -451,9 +474,7 @@ class BCCEMOptimizer(DecentCEMOptimizer):
         use_value_weights: bool = True,
         ir_low: float = 0.3,
         ir_high: float = 1.0,
-        ir_high_target: Optional[float] = None,
         early_stop: bool = True,
-        early_stop_ir: float = 0.1,
         early_stop_mu: float = 1e-3,
         early_stop_patience: int = 1,
     ):
@@ -477,37 +498,96 @@ class BCCEMOptimizer(DecentCEMOptimizer):
         self.use_value_weights = bool(use_value_weights)
         self.ir_low = float(ir_low)
         self.ir_high = float(ir_high)
-        self.ir_high_target = ir_high_target
         self.early_stop = bool(early_stop)
-        self.early_stop_ir = float(early_stop_ir)
         self.early_stop_mu = float(early_stop_mu)
         self.early_stop_patience = int(early_stop_patience)
-        self._ir_high_start = float(self.ir_high)
 
         # BC-CEM internal state used by MPC 
-        self._centroid_type = "moment"
+        self._centroid_type = "moment"   # "moment" or "geometric"
         self._diagnostics: dict = {}
         self._centroid_mean: Optional[torch.Tensor] = None
         self._centroid_dispersion: Optional[torch.Tensor] = None
 
-        # Persistent MPC state (kept across calls to optimize; clear on reset)
+        # Persistent MPC state (kept across calls to optimize; clear on reset
+        self._exec_mode = "centroid"
         self._sticky_worker_idx: Optional[int] = None
         self._state_mu_w: Optional[torch.Tensor] = None
         self._state_disp_w: Optional[torch.Tensor] = None
         self._last_ir_norm: Optional[float] = None
+        self._last_jitter_scale = self.init_jitter_scale
 
         self.use_sticky_worker = True
-        self.use_precond = True
-        self.ir_ema_alpha = 0.9
-        self.var_eps = (self.upper_bound - self.lower_bound).mean().item() ** 2 / 256  # [-1, 1] -> var_eps ~ 1e-4
-        
+        self.sticky_patience_max = 5
+        self.sticky_patience = self.sticky_patience_max
+        self.var_eps = DISPERSION_EPS
+
+        # ---- IR adaptation ----
+        self.ir_adapt = True
+        self.ir_adapt_alpha = 0.97         # slow update; 0.95–0.995 are reasonable
+        self.ir_adapt_warmup = 10          # MPC calls before using adapted thresholds
+        self.ir_adapt_k_low = 0.95          # band width below mean in log-space
+        self.ir_adapt_k_high = 0.95         # band width above mean in log-space
+        self.ir_min_low = 0.01
+        self.ir_max_high = 10.0
+        self.ir_min_gap = 0.05            
+
+        self._ir_log_ema = None
+        self._ir_log_var_ema = None
+        self._ir_adapt_steps = 0
+
+    def _init_population_params(
+        self, x0: torch.Tensor, jitter_scale: float = 0.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        W = int(self.num_workers)
+        is_worker_init = bool(x0.dim() == 3 and int(x0.shape[0]) == W)
+
+        # Start from provided means (per-worker if available).
+        mean = x0.clone() if is_worker_init else x0.expand((W,) + x0.shape)
+        action_range = (self.upper_bound - self.lower_bound).unsqueeze(0)
+
+        # If the initial solution isn't per-worker, add noise to break symmetry across workers.
+        if not is_worker_init:
+            mean = torch.clamp(
+                mean + (0.01 * action_range) * torch.randn_like(mean),
+                min=self.lower_bound,
+                max=self.upper_bound,
+            )
+
+        # Initialize dispersion around the default CEM scale.
+        if self._clipped_normal:
+            dispersion = torch.ones_like(mean)
+            if not is_worker_init:
+                dispersion = dispersion + (0.05 * action_range) * torch.randn_like(mean).abs()
+        else:
+            base_var = (((self.upper_bound - self.lower_bound) ** 2) / 16).unsqueeze(0)
+            dispersion = base_var.expand_as(mean)
+            if not is_worker_init:
+                # Multiplicative perturbation keeps units consistent (variance).
+                dispersion = dispersion * (1.0 + 0.5 * torch.randn_like(mean).abs())
+
+        dispersion = torch.clamp(dispersion, min=DISPERSION_EPS)
+
+        # Optional extra jitter (typically annealed across MPC steps).
+        if jitter_scale > 0:
+            mean = torch.clamp(
+                mean
+                + jitter_scale
+                * torch.randn_like(mean)
+                * torch.sqrt(dispersion + self._eps),
+                min=self.lower_bound,
+                max=self.upper_bound,
+            )
+        return mean, dispersion
+
     def reset(self) -> None:
         self._diagnostics = {}
         self._centroid_mean = None
         self._centroid_dispersion = None
         self._sticky_worker_idx = None
+        self.sticky_patience = self.sticky_patience_max
         self._state_mu_w = None
         self._state_disp_w = None
+        self._last_jitter_scale = self.init_jitter_scale
         # self._last_ir_norm = None
     
     def get_diagnostics(self) -> dict:
@@ -591,7 +671,57 @@ class BCCEMOptimizer(DecentCEMOptimizer):
         var_c = torch.clamp(var_c, min=self.var_eps)
         disp_c = self._from_var(var_c)
         return mu_c, disp_c, var_c
-    
+
+    def _update_ir_stats(self, ir_norm: Optional[float]) -> None:
+        if ir_norm is None:
+            return
+        try:
+            x = float(ir_norm)
+        except (TypeError, ValueError):
+            return
+        if (not math.isfinite(x)) or (x <= 0.0):
+            return
+        lx = math.log(x + 1e-12)
+
+        if self._ir_log_ema is None or self._ir_log_var_ema is None:
+            self._ir_log_ema = lx
+            self._ir_log_var_ema = 0.0
+            self._ir_adapt_steps = 1
+            return
+
+        a = float(self.ir_adapt_alpha)
+        m_old = float(self._ir_log_ema)                 # old mean for variance update
+        self._ir_log_ema = a * m_old + (1.0 - a) * lx
+        # EWMA variance on residuals (stable enough for thresholding)
+        r = lx - m_old
+        v_old = float(self._ir_log_var_ema)
+        self._ir_log_var_ema = a * v_old + (1.0 - a) * (r * r)
+
+        self._ir_adapt_steps += 1
+
+
+    def _adaptive_ir_thresholds(self) -> Tuple[float, float]:
+        # fallback to config defaults
+        low0, high0 = float(self.ir_low), float(self.ir_high)
+
+        if (not getattr(self, "ir_adapt", False)) or self._ir_log_ema is None or self._ir_log_var_ema is None:
+            return low0, high0
+        if int(getattr(self, "_ir_adapt_steps", 0)) < int(getattr(self, "ir_adapt_warmup", 0)):
+            return low0, high0
+
+        mu = float(self._ir_log_ema)
+        std = math.sqrt(max(1e-12, float(self._ir_log_var_ema)))
+
+        low = math.exp(mu - float(self.ir_adapt_k_low) * std)
+        high = math.exp(mu + float(self.ir_adapt_k_high) * std)
+
+        low = max(float(self.ir_min_low), low)
+        high = min(float(self.ir_max_high), high)
+        if high <= low + float(self.ir_min_gap):
+            high = low + float(self.ir_min_gap)
+
+        return low, high
+
     def optimize(
         self,
         obj_fun: ObjectiveFn,
@@ -599,53 +729,61 @@ class BCCEMOptimizer(DecentCEMOptimizer):
         callback: OptimizerCallback = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Clear per-call diagnostics/state
         self._diagnostics = {}
+        curr_low, curr_high = self._adaptive_ir_thresholds()
 
-        # ir_low = float(self.ir_low)
-        # ir_high = float(self.ir_high)
+        if x0 is None:
+            raise ValueError("BCCEMOptimizer requires an initial solution x0.")
+        x0 = x0.to(device=self.device)
+        action_shape = tuple(x0.shape)
+        x0_like = x0
+        if x0.dim() == 3 and int(x0.shape[0]) == int(self.num_workers):
+            action_shape = tuple(x0.shape[1:])
+            x0_like = x0[0]
 
-        # use last ir norm to keep a ir band adaptive to dynamics/model changes
-        ir_low = float(self.ir_low)
-        ir_high = float(self.ir_high)
-        if self._last_ir_norm is not None:
-            # compute a target band from the ema of last ir norm and smoothly move towards it
-            target_ir_high = self._last_ir_norm * 1.5 
-            target_ir_low = self._last_ir_norm * 0.5
-            self.ir_low += 0.1 * (target_ir_low - self.ir_low)
-            self.ir_high += 0.1 * (target_ir_high - self.ir_high)
-            ir_low = float(self.ir_low)
-            ir_high = float(self.ir_high)
-            print(f"Adjusted IR band to [{ir_low:.4f}, {ir_high:.4f}] based on last IR norm {self._last_ir_norm:.4f}")
+        # anneal jitter scale
+        if self.init_jitter_scale > 0:
+            self._last_jitter_scale *= 0.9
+            self._last_jitter_scale = max(self._last_jitter_scale, 0.0)
 
-        # Warm start from persistent state if available
-        mu_w, disp_w = self._init_population_params(x0, jitter_scale=self.init_jitter_scale)
-        used_warm_start_state = False
-        if (self._state_mu_w is not None) and (self._state_disp_w is not None):
-            # if shape matches, use persistent state (falls back to re-init otherwise)
-            if (self._state_mu_w.shape == mu_w.shape) and (self._state_disp_w.shape == disp_w.shape):
-                mu_w = self._state_mu_w
-                disp_w = self._state_disp_w
-            used_warm_start_state = True
+        # warm start
+        mu_w, disp_w = self._init_population_params(x0, jitter_scale=self._last_jitter_scale)
+        if (
+            (self._state_mu_w is not None)
+            and (self._state_disp_w is not None)
+            and not (x0.dim() == 3 and int(x0.shape[0]) == int(self.num_workers))
+        ):
+            mu_prev, disp_prev = self._state_mu_w, self._state_disp_w
+            H = int(mu_w.shape[1])
+            if H > 1:
+                frac = torch.arange(H, device=mu_w.device, dtype=mu_w.dtype).mul_(1.0 / float(H - 1))
+                w_state = ((1.0 - frac) * (1.0 - frac)).view(1, H, 1)
+            else:
+                w_state = torch.zeros((1, H, 1), device=mu_w.device, dtype=mu_w.dtype)
+
+            mu_w = torch.lerp(mu_w, mu_prev, w_state)
+            disp_w = torch.lerp(disp_w, disp_prev, w_state)
+            mu_w = torch.clamp(mu_w, min=self.lower_bound, max=self.upper_bound)
+            disp_w = torch.clamp(disp_w, min=DISPERSION_EPS)
         else:
             self._state_mu_w = None
             self._state_disp_w = None
 
         W = int(self.num_workers)
         weights = torch.full((W,), 1.0 / max(1, W), device=self.device)
-        dim = int(x0.numel())
+        dim = int(x0_like.numel())
         population = self._get_buffer(
             "population",
-            (W, self.population_size) + tuple(x0.shape),
+            (W, self.population_size) + tuple(action_shape),
             device=self.device,
         )
 
-        best_solution = torch.empty_like(x0)
+        best_solution = torch.empty_like(x0_like)
         best_value = -float("inf")
         best_worker_idx = 0
         worker_best_solution = self._get_buffer(
             "worker_best_solution",
-            (W,) + tuple(x0.shape),
+            (W,) + tuple(action_shape),
             device=self.device,
         )
         worker_best_value = torch.full((W,), -float("inf"), device=self.device)
@@ -658,7 +796,7 @@ class BCCEMOptimizer(DecentCEMOptimizer):
 
         for i in range(self.num_iterations):
             population = self._sample_population(mu_w, disp_w, population)
-            flat_population = population.reshape(-1, *x0.shape)
+            flat_population = population.reshape(-1, *action_shape)
             values = obj_fun(flat_population).reshape(W, self.population_size)
             self._sanitize_values_(values)
                 
@@ -703,20 +841,19 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             ir_max = float(ir_max.detach().cpu())
             ir_norm = float(ir_norm.detach().cpu())
 
-            # gated consensus coefficient
-            # beta = self.consensus_coef * float(((i + 1) / max(1, self.num_iterations)) ** self.consensus_anneal_power)
-            # beta = max(0.0, min(1.0, beta))
-            # t = (float(ir_norm) - ir_low) / (ir_high - ir_low)
-            # t = max(0.0, min(1.0, t))
 
-            # consensus update
-            beta = self.consensus_coef
+            # gated consensus coefficient
+            beta_base = self.consensus_coef
+            beta = beta_base * float(((i + 1) / max(1, self.num_iterations)) ** self.consensus_anneal_power)
+
             if beta > 0.0 and W > 1:
-                scale = torch.ones_like(kl_w) * float(ir_norm)
-                beta_w = (beta * (1.0 / (1.0 + scale))).clamp(0.0, 1.0)
+                # Scale consensus per worker by its normalized KL to the centroid.
+                scale = (kl_w / float(max(1, dim))).clamp(min=0.0)  # (W,)
+                beta_w = (beta / (1.0 + scale)).clamp(0.0, 1.0)
                 beta_w = beta_w.view(-1, 1, 1)
 
-                if ir_norm < ir_low: # centroid is representative: move workers towards centroid
+                # Unimodal: consensus update
+                if ir_norm < curr_low:
                     mu_w = (1.0 - beta_w) * mu_w + beta_w * mu_c.unsqueeze(0)
                     mu_w = torch.clamp(mu_w, min=self.lower_bound, max=self.upper_bound)
 
@@ -727,55 +864,97 @@ class BCCEMOptimizer(DecentCEMOptimizer):
 
                 else:
                     """
-                    Decomposes the scalar Information Radius into Principal Components
-                    of Fisher-weighted disagreement.
+                    Decomposes the scalar Information Radius into Principal Components of Fisher-weighted disagreement.
                     """ 
-                    mu_diff = mu_w - mu_c.unsqueeze(0)              # (W,H,A)
-                    w_view = weights.view(-1, 1, 1, 1)              # (W,1,1,1)
-                    sigma_signal = torch.sum(w_view * (mu_diff.unsqueeze(-1) * mu_diff.unsqueeze(-2)), dim=0)  # (H,A,A)
+                    # FAST path
+                    mu_diff = mu_w - mu_c.unsqueeze(0)                               # (W,H,A)
                     sigma_noise_diag = torch.clamp(var_w.mean(dim=0), min=self.var_eps)  # (H,A)
-                    inv_sqrt = 1.0 / torch.sqrt(sigma_noise_diag)                          # (H,A)
+                    inv_sqrt = torch.rsqrt(sigma_noise_diag)                         # (H,A)
+                    sqrt_w = torch.sqrt(weights).view(W, 1, 1)                       # (W,1,1)
 
-                    # symmetric whitened disagreement matrix
-                    F = sigma_signal * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)     # (H,A,A)
-                    evals, evecs = torch.linalg.eigh(F)                                    # evals asc, evecs columns
+                    # Zt: (H,A,W) where columns are z_w = sqrt(pi_w)*D^{-1/2}*(mu_w - mu_c)
+                    Zt = (mu_diff * sqrt_w * inv_sqrt.unsqueeze(0)).permute(1, 2, 0).contiguous()  # (H,A,W)
+                    
+                    # Gram matrix: G = Z^T Z  (H,W,W)
+                    G = torch.matmul(Zt.transpose(-2, -1), Zt)                       # (H,W,W)
+                    lam, U = torch.linalg.eigh(G)                                    # lam asc, U columns  (H,W), (H,W,W)
+                    tau = 1.0
+                    lam_safe = torch.clamp(lam, min=1e-12)
 
-                    tau = 1.0  # threshold for shared subspace
-                    shared_mask = (evals <= tau).to(dtype=mu_w.dtype)                      # (H,A)
+                    inv_lam_disagree = (lam > tau).to(mu_w.dtype) / lam_safe         # (H,W)
+                    delta = (mu_c.unsqueeze(0) - mu_w).permute(1, 0, 2).contiguous() # (H,W,A)
+                    ZtT = Zt.transpose(-2, -1)       
+                    y = torch.matmul(ZtT.unsqueeze(1), delta.unsqueeze(-1)).squeeze(-1)  # (H,W,W)
 
-                    # project (mu_c - mu_w) onto shared subspace
-                    delta = (mu_c.unsqueeze(0) - mu_w)                                     # (W,H,A)
-                    Vt = evecs.transpose(-2, -1)                                           # (H,A,A)
+                    # coordinates in eigenbasis of G
+                    c = torch.matmul(y, U)                                           # (H,W,W)
 
-                    # coeff = V^T delta
-                    coeff = torch.matmul(Vt.unsqueeze(0), delta.unsqueeze(-1)).squeeze(-1) # (W,H,A)
-                    coeff = coeff * shared_mask.unsqueeze(0)                               # zero mode directions
-                    delta_shared = torch.matmul(evecs.unsqueeze(0), coeff.unsqueeze(-1)).squeeze(-1)  # (W,H,A)
+                    # apply Λ^{-1} only to disagree coords (others 0)
+                    c = c * inv_lam_disagree.unsqueeze(1)                             # (H,W,W)
 
-                    beta_shared = self.consensus_coef
-                    mu_w = mu_w + (beta_shared * beta_w) * delta_shared
+                    # back to W-space: y_back = U c
+                    y_back = torch.matmul(c, U.transpose(-2, -1))                     # (H,W,W)
+
+                    # project back to A: proj_disagree = (Z y_back)  (row-form)
+                    proj_disagree = torch.matmul(y_back, ZtT)                         # (H,W,A)
+                    delta_shared = (delta - proj_disagree).permute(1, 0, 2).contiguous() # (W,H,A)
+
+                    # Apply the same per-worker gated consensus strength to the shared component.
+                    mu_w = mu_w + beta_w * delta_shared
                     mu_w = torch.clamp(mu_w, min=self.lower_bound, max=self.upper_bound)
 
-                    # optional: share variance in shared subspace (diagonal approximation)
-                    V2 = evecs * evecs                                                    # (H,A,A)
-                    s_w = torch.einsum("hak,wha->whk", V2, var_w)                          # (W,H,A)
-                    s_c = torch.einsum("hak,ha->hk", V2, var_c)                            # (H,A)
+                    # Keep variance unchanged
 
-                    mask_w = shared_mask.unsqueeze(0)                                      # (1,H,A)
-                    s_w_new = (1.0 - (beta_shared * beta_w)) * s_w + (beta_shared * beta_w) * s_c.unsqueeze(0)
-                    s_w = mask_w * s_w_new + (1.0 - mask_w) * s_w                          # only shared directions
-                    var_w = torch.einsum("hak,whk->wha", V2, s_w)                           # back to diag
-                    var_w = torch.clamp(var_w, min=self.var_eps)
-                    disp_w = self._from_var(var_w)
+                    # mu_diff = mu_w - mu_c.unsqueeze(0)              # (W,H,A)
+                    # w_view = weights.view(-1, 1, 1, 1)              # (W,1,1,1)
+                    # sigma_signal = torch.sum(w_view * (mu_diff.unsqueeze(-1) * mu_diff.unsqueeze(-2)), dim=0)  # (H,A,A)
+                    # sigma_noise_diag = torch.clamp(var_w.mean(dim=0), min=self.var_eps)  # (H,A)
+                    # inv_sqrt = 1.0 / torch.sqrt(sigma_noise_diag)                          # (H,A)
+
+                    # # symmetric whitened disagreement matrix
+                    # F = sigma_signal * inv_sqrt.unsqueeze(-1) * inv_sqrt.unsqueeze(-2)     # (H,A,A)
+                    # evals, evecs = torch.linalg.eigh(F)                                    # evals asc, evecs columns
+
+                    # tau = 1.0  # threshold for shared subspace
+                    # shared_mask = (evals <= tau).to(dtype=mu_w.dtype)                      # (H,A)
+
+                    # # project (mu_c - mu_w) onto shared subspace
+                    # delta = (mu_c.unsqueeze(0) - mu_w)                                     # (W,H,A)
+                    # Vt = evecs.transpose(-2, -1)                                           # (H,A,A)
+
+                    # # coeff = V^T delta
+                    # coeff = torch.matmul(Vt.unsqueeze(0), delta.unsqueeze(-1)).squeeze(-1) # (W,H,A)
+                    # coeff = coeff * shared_mask.unsqueeze(0)                               # zero mode directions
+                    # delta_shared = torch.matmul(evecs.unsqueeze(0), coeff.unsqueeze(-1)).squeeze(-1)  # (W,H,A)
+
+                    # beta_shared = self.consensus_coef
+                    # mu_w = mu_w + (beta_shared * beta_w) * delta_shared
+                    # mu_w = torch.clamp(mu_w, min=self.lower_bound, max=self.upper_bound)
+
+                    # # keep variance unchanged
+                    # # optional: share variance in shared subspace (diagonal approximation)
+                    # V2 = evecs * evecs                                                    # (H,A,A)
+                    # s_w = torch.einsum("hak,wha->whk", V2, var_w)                          # (W,H,A)
+                    # s_c = torch.einsum("hak,ha->hk", V2, var_c)                            # (H,A)
+
+                    # mask_w = shared_mask.unsqueeze(0)                                      # (1,H,A)
+                    # s_w_new = (1.0 - (beta_shared * beta_w)) * s_w + (beta_shared * beta_w) * s_c.unsqueeze(0)
+                    # s_w = mask_w * s_w_new + (1.0 - mask_w) * s_w                          # only shared directions
+                    # var_w = torch.einsum("hak,whk->wha", V2, s_w)                           # back to diag
+                    # var_w = torch.clamp(var_w, min=self.var_eps)
+                    # disp_w = self._from_var(var_w)
                 
             if self.early_stop:
                 mu_shift = None
+                var_c_flag = False
                 if prev_mu_c is not None:
-                    mu_shift = float(torch.sqrt(torch.mean(torch.square(mu_c - prev_mu_c))).detach().cpu())
-                    var_c_flag = torch.mean(var_c) <= self.var_eps * 1.1
+                    mu_shift = float(
+                        torch.sqrt(torch.mean(torch.square(mu_c - prev_mu_c))).detach().cpu()
+                    )
+                    var_c_flag = bool(torch.mean(var_c) <= self.var_eps * 10.0)
                 prev_mu_c = mu_c.detach()
-                if (mu_shift is not None) and (ir_norm is not None):
-                    if (ir_norm <= self.early_stop_ir) and (mu_shift <= self.early_stop_mu) and (not var_c_flag):
+                if mu_shift is not None:
+                    if (mu_shift <= self.early_stop_mu) and var_c_flag:
                         stall_count += 1
                     else:
                         stall_count = 0
@@ -788,76 +967,57 @@ class BCCEMOptimizer(DecentCEMOptimizer):
 
         exec_solution = best_solution
         exec_source = "best"
-
+        mode = getattr(self, "_exec_mode", "centroid")
+        
         if self.return_mean_elites:
+            if mode not in {"centroid", "worker"}:
+                mode = "centroid"
             if ir_norm is not None:
-                if ir_norm > ir_high:
-                    # Multimodal regime: avoid switching modes every MPC step by using
-                    # a sticky worker if available
-                    if self.use_sticky_worker: 
-                        chosen = self._sticky_worker_idx
-                        chosen_ok = False
-                        if chosen is not None:
-                            try:
-                                chosen_ok = float(weights[int(chosen)]) >= 0.3
-                            except Exception:
-                                chosen_ok = False
-                        if not chosen_ok:
-                            chosen = int(torch.distributions.Categorical(weights).sample().detach().cpu())
-                        self._sticky_worker_idx = chosen
-                        exec_solution = mu_w[int(chosen)]
-                        exec_source = "stick_worker" + f"_{chosen}"
-                    else:
-                        chosen = int(torch.distributions.Categorical(weights).sample().detach().cpu())
-                        exec_solution = mu_w[chosen]
-                        exec_source = "sampled"
-                
-                elif ir_norm < ir_low:
-                    # Unimodal regime: go to centroid
-                    exec_solution = mu_c
-                    exec_source = "centroid"
-                    self._sticky_worker_idx = None 
-                
+                # Hysteresis on IR to avoid rapid switching.
+                if mode == "worker":
+                    if ir_norm < curr_low:
+                        mode = "centroid"
                 else:
-                    # In-between regime: Thompson-type sampling
-                    p_ = (ir_norm - ir_low) / (ir_high - ir_low)
-                    if torch.rand((), device=weights.device).item() < p_:
-                        # sample a higher-weighted worker
-                        chosen = int(torch.distributions.Categorical(weights).sample().detach().cpu())
-                        exec_solution = mu_w[chosen]
-                        exec_source = "sampled"
-                        self._sticky_worker_idx = None
-                    else:
-                        exec_solution = mu_c
-                        exec_source = "centroid"
-                        self._sticky_worker_idx = None
-            else:
-                exec_solution = mu_w[best_worker_idx]
-                exec_source = "best"
+                    if ir_norm > curr_high:
+                        mode = "worker"
+            
+            self._exec_mode = mode
 
-        # Cache IR norm with EMA
-        if ir_norm is not None:
-            x = float(ir_norm)
-            if self._last_ir_norm is None or (not math.isfinite(self._last_ir_norm)):
-                self._last_ir_norm = x
+            if mode == "centroid":
+                exec_solution = mu_c
+                exec_source = "centroid"
             else:
-                a = float(self.ir_ema_alpha)
-                a = max(0.0, min(1.0, a))
-                self._last_ir_norm = a * float(self._last_ir_norm) + (1.0 - a) * x
+                chosen, chosen_ok = self._sticky_worker_idx, False
+                if self.use_sticky_worker and chosen is not None and self.sticky_patience > 0:
+                    chosen_ok = True
+                    self.sticky_patience -= 1
+                if not chosen_ok:
+                    if (not torch.isfinite(weights).all()) or float(weights.sum()) <= 0.0:
+                        weights = torch.full_like(weights, 1.0 / max(1, int(weights.numel())))
+                    chosen = int(
+                        torch.distributions.Categorical(weights).sample().detach().cpu().item()
+                    )
+                    self.sticky_patience = self.sticky_patience_max 
+                self._sticky_worker_idx = chosen
+                exec_solution = mu_w[chosen]
+                exec_source = f"worker_{chosen}"
+
+        self._last_ir_norm = ir_norm
+        self._update_ir_stats(ir_norm)
+
+        # Expose final worker distributions (useful for POPLIN).
+        self._last_mu_w = mu_w.detach().clone()
+        self._last_disp_w = disp_w.detach().clone()
+        self._last_worker_weights = weights.detach().clone()
 
         self._state_mu_w = mu_w.detach().clone()
         self._state_disp_w = disp_w.detach().clone()
 
         self._diagnostics = {
-            "weights": weights.detach().cpu().numpy().tolist(),
             "sticky_worker_idx": int(self._sticky_worker_idx) if self._sticky_worker_idx is not None else None,
-            "used_warm_start_state": bool(used_warm_start_state),
-            "sticky_worker_weight": float(
-                weights[int(self._sticky_worker_idx)].detach().cpu()
-            ) if self._sticky_worker_idx is not None else None,
             "ir_norm": float(ir_norm) if ir_norm is not None else None,
-            "ir_low": float(ir_low),
-            "ir_high": float(ir_high),
+            "ir_low": float(curr_low),
+            "ir_high": float(curr_high),
             "ir_max": float(ir_max) if ir_max is not None else None,
             "exec_source": exec_source,
         }
@@ -865,14 +1025,16 @@ class BCCEMOptimizer(DecentCEMOptimizer):
         return exec_solution
     
     def advance(self, steps: int = 1) -> None:
+        """Advances the internal state by the given number of steps and fills in new steps with default distributions."""
+        # Sanity checks
         if self._state_mu_w is None or self._state_disp_w is None:
             return
-        steps = int(steps)
         if steps <= 0:
             return
 
         mu = self._state_mu_w
         disp = self._state_disp_w
+
         if (not torch.is_tensor(mu)) or (not torch.is_tensor(disp)) or mu.dim() != 3 or disp.dim() != 3:
             self._state_mu_w = None
             self._state_disp_w = None
@@ -880,9 +1042,9 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             return
 
         W, H, A = int(mu.shape[0]), int(mu.shape[1]), int(mu.shape[2])
-
         mid = (self.lower_bound + self.upper_bound) * 0.5  # (H,A)
 
+        # If we are advancing past the horizon, reset to mid-range
         if steps >= H:
             mu_new = mid.unsqueeze(0).expand(W, H, A).clone()
             if self._clipped_normal:
@@ -895,6 +1057,7 @@ class BCCEMOptimizer(DecentCEMOptimizer):
             self._sticky_worker_idx = None
             return
 
+        # Roll the distributions and fill in the last `steps` with mid-range values
         mu = mu.roll(shifts=-steps, dims=1)
         disp = disp.roll(shifts=-steps, dims=1)
 
@@ -985,7 +1148,10 @@ class GMMCEMOptimizer(Optimizer):
     def _init_population_params(
         self, x0: torch.Tensor, jitter_scale: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        mean = x0.expand((self.num_workers,) + x0.shape).clone()
+        if x0.dim() == 3 and int(x0.shape[0]) == int(self.num_workers):
+            mean = x0.clone()
+        else:
+            mean = x0.expand((self.num_workers,) + x0.shape).clone()
         if self._clipped_normal:
             dispersion = torch.ones_like(mean)
         else:
@@ -995,7 +1161,7 @@ class GMMCEMOptimizer(Optimizer):
             mean = torch.clamp(
                 mean
                 + jitter_scale
-                * torch.randn((self.num_workers,) + x0.shape, device=self.device)
+                * torch.randn_like(mean)
                 * torch.sqrt(dispersion + self._eps),
                 min=self.lower_bound,
                 max=self.upper_bound,
@@ -1068,16 +1234,24 @@ class GMMCEMOptimizer(Optimizer):
         callback: OptimizerCallback = None,
         **kwargs,
     ) -> torch.Tensor:
+        if x0 is None:
+            raise ValueError("GMMCEMOptimizer requires an initial solution x0.")
+        action_shape = tuple(x0.shape)
+        x0_like = x0
+        if x0.dim() == 3 and int(x0.shape[0]) == int(self.num_workers):
+            action_shape = tuple(x0.shape[1:])
+            x0_like = x0[0]
+
         mu, dispersion, mix = self._init_population_params(
             x0, jitter_scale=self.init_jitter_scale
         )
-        best_solution = torch.empty_like(x0)
+        best_solution = torch.empty_like(x0_like)
         best_value = -float("inf")
         best_worker = 0
 
         total_samples = self.population_size * self.num_workers
         population = self._get_buffer(
-            "population", (total_samples,) + tuple(x0.shape), device=self.device
+            "population", (total_samples,) + tuple(action_shape), device=self.device
         )
 
         for i in range(self.num_iterations):
@@ -1126,6 +1300,15 @@ class GMMCEMOptimizer(Optimizer):
             mix = self._enforce_min_component_weight(mix)
 
             mu = torch.clamp(mu, min=self.lower_bound, max=self.upper_bound)
+
+        # Expose final mixture components (useful for POPLIN-style distillation).
+        try:
+            self._last_mu_w = mu.detach().clone()
+            self._last_disp_w = dispersion.detach().clone()
+            self._last_worker_weights = mix.detach().clone()
+            self._last_best_worker_idx = int(best_worker)
+        except Exception:
+            pass
 
         if self.return_mean_elites:
             return mu[best_worker]
@@ -1705,7 +1888,7 @@ class TrajectoryOptimizer:
 
     The optimization variables for the problem will have shape ``H x A``, where ``H`` and ``A``
     represent planning horizon and action dimension, respectively. The initial solution for the
-    optimizer will be computed as (action_ub - action_lb) / 2, for each time step.
+    optimizer will be computed as (action_ub + action_lb) / 2 (the midpoint), for each time step.
 
     Args:
         optimizer_cfg (omegaconf.DictConfig): the configuration of the optimizer to use.
@@ -1748,6 +1931,7 @@ class TrajectoryOptimizer:
         self,
         trajectory_eval_fn: Callable[[torch.Tensor], torch.Tensor],
         callback: OptimizerCallback = None,
+        x0: Optional[torch.Tensor] = None,
     ) -> np.ndarray:
         """Runs the trajectory optimization.
 
@@ -1764,9 +1948,10 @@ class TrajectoryOptimizer:
             (np.ndarray): the best action sequence.
         """
         self.last_plan_debug = None
+        x0_in = self.previous_solution if x0 is None else x0
         best_solution = self.optimizer.optimize(
             trajectory_eval_fn,
-            x0=self.previous_solution,
+            x0=x0_in,
             callback=callback,
         )
         self.last_plan_debug = self.optimizer.get_diagnostics()
@@ -1873,10 +2058,7 @@ class TrajectoryOptimizerAgent(Agent):
         risk_spread_coef: float = 0.0,
         particle_schedule: str = "fixed",       # "fixed" or "ir" (used by BC-CEM)
         cv_low_threshold: float = 0.1,
-        ir_ema_alpha: float = 0.9,
         particles_min_frac: float = 0.25,
-        ir_particles_low: float = 0.35,
-        ir_particles_high: float = 1.5,
         skip_replan_if_ir_low: bool = False,
         skip_replan_ir_threshold: float = 0.1,
         skip_replan_max_frac: float = 0.5,
@@ -1912,13 +2094,14 @@ class TrajectoryOptimizerAgent(Agent):
         self.two_stage_topk_frac = two_stage_topk_frac
         self.two_stage_max_topk = two_stage_max_topk
         self.risk_spread_coef = risk_spread_coef
-        self.particle_schedule = particle_schedule
+        schedule = str(particle_schedule).lower()
+        if schedule not in {"fixed", "ir"}:
+            raise ValueError(
+                f"Invalid particle_schedule={particle_schedule!r}. Supported values: 'fixed', 'ir'."
+            )
+        self.particle_schedule = schedule
         self.cv_low_threshold = float(cv_low_threshold)
-        self.ir_ema_alpha = float(ir_ema_alpha)
-        self.ir_norm_ema: Optional[float] = None
         self.particles_min_frac = particles_min_frac
-        self.ir_particles_low = ir_particles_low
-        self.ir_particles_high = ir_particles_high
         self.skip_replan_if_ir_low = skip_replan_if_ir_low
         self.skip_replan_ir_threshold = float(skip_replan_ir_threshold)
         self.skip_replan_max_frac = float(skip_replan_max_frac)
@@ -1936,6 +2119,10 @@ class TrajectoryOptimizerAgent(Agent):
                 :class:`TrajectoryOptimizer`.
         """
         self.trajectory_eval_fn = trajectory_eval_fn
+
+    def _get_warm_start(self, _obs: np.ndarray) -> Optional[torch.Tensor]:
+        """Optional hook for providing a warm-start solution to the underlying optimizer."""
+        return None
 
     def reset(self, planning_horizon: Optional[int] = None):
         """Resets the underlying trajectory optimizer."""
@@ -1958,25 +2145,6 @@ class TrajectoryOptimizerAgent(Agent):
         self.last_plan_model_steps_est = 0
         self.last_plan_time = 0.0
         self.last_plan_debug = None
-        self.ir_norm_ema = None
-
-    def _update_ir_norm_ema_from_debug(self) -> None:
-        dbg = self.last_plan_debug
-        if not isinstance(dbg, dict):
-            return
-        ir_norm = dbg.get("ir_norm", None)
-        if ir_norm is None:
-            return
-        try:
-            x = float(ir_norm)
-        except (TypeError, ValueError):
-            return
-        if not np.isfinite(x):
-            return
-        alpha = float(getattr(self, "ir_ema_alpha", 0.9))
-        alpha = max(0.0, min(1.0, alpha))
-        prev = self.ir_norm_ema
-        self.ir_norm_ema = x if (prev is None or (not np.isfinite(prev))) else (alpha * float(prev) + (1.0 - alpha) * x)
 
     def act(
         self, obs: np.ndarray, optimizer_callback: OptimizerCallback = None, **_kwargs
@@ -2013,13 +2181,13 @@ class TrajectoryOptimizerAgent(Agent):
                 return False
             try:
                 if ir_low is not None:
-                    skip_thresh = float(ir_low) * 1.0
+                    return float(ir_norm) <= float(ir_low)
                 else:
-                    skip_thresh = float(self.skip_replan_ir_threshold)
-                return float(ir_norm) < skip_thresh
+                    return float(ir_norm) <= self.skip_replan_ir_threshold
             except (TypeError, ValueError):
                 return False
 
+        did_replan = False
         plan_time = 0.0
         if self._action_cache is not None and self._action_cache_idx >= self._replan_cache_len:
             # At the nominal replan boundary: optionally skip replanning if IR indicates a
@@ -2047,15 +2215,23 @@ class TrajectoryOptimizerAgent(Agent):
             or self._action_cache_idx >= self._replan_cache_len
         )
         if need_replan:
+            did_replan = True
+            x0_override = None
+            try:
+                x0_override = self._get_warm_start(obs)
+            except Exception:
+                x0_override = None
+
             def trajectory_eval_fn(action_sequences):
                 return self.trajectory_eval_fn(obs, action_sequences)
 
             start_time = time.perf_counter()
-            plan = self.optimizer.optimize(trajectory_eval_fn, callback=optimizer_callback)
+            plan = self.optimizer.optimize(
+                trajectory_eval_fn, callback=optimizer_callback, x0=x0_override
+            )
             plan_time = time.perf_counter() - start_time
             plan_debug = getattr(self.optimizer, "last_plan_debug", None)
             self.last_plan_debug = plan_debug if isinstance(plan_debug, dict) else None
-            self._update_ir_norm_ema_from_debug()
 
             # Optional: add model-predicted return uncertainty for the selected plan.
             eval_fn = getattr(self, "_model_env_eval_action_sequences", None)
@@ -2129,7 +2305,7 @@ class TrajectoryOptimizerAgent(Agent):
 
         # If we executed beyond the nominal warm-start shift window, advance the warm start.
         rf = int(max(1, self.replan_freq))
-        if plan_time == 0.0 and idx >= rf:
+        if (not did_replan) and idx >= rf:
             self.optimizer.advance(1)
 
         if self._action_cache_idx >= self._action_cache.shape[0]:
@@ -2301,69 +2477,61 @@ def create_trajectory_optim_agent_for_model(
         """
         # ---- dynamic particle schedule (uses diagnostics from previous MPC step) ----
         particles = base_num_particles
-        ir_t: Optional[float] = None
-        schedule = getattr(agent, "particle_schedule", "fixed")
-        if schedule in {"ir", "ir_ema", "ir_raw"}:
-            dbg = getattr(agent, "last_plan_debug", None)
-            pred_cv = None
+        stable_unimodal = False
+        if agent.particle_schedule == "ir":
+            dbg = agent.last_plan_debug
             if isinstance(dbg, dict):
-                pred_cv = dbg.get("pred_return_cv", None)
-            try:
-                pred_cv_v = float(pred_cv)
-            except (TypeError, ValueError):
-                pred_cv_v = None
-            cv_ok = (
-                pred_cv_v is not None
-                and math.isfinite(pred_cv_v)
-                and pred_cv_v <= float(getattr(agent, "cv_low_threshold", 0.1))
-            )
-            if cv_ok:
-                ir_norm = None
-                if isinstance(dbg, dict):
-                    ir_norm = dbg.get("ir_norm", None)
-                ir_used = None
-                if schedule != "ir_raw":
-                    ir_used = getattr(agent, "ir_norm_ema", None)
-                if ir_used is None and ir_norm is not None:
+                try:
+                    pred_cv_v = float(dbg.get("pred_return_cv", None))
+                except (TypeError, ValueError):
+                    pred_cv_v = None
+                cv_ok = (
+                    pred_cv_v is not None
+                    and math.isfinite(pred_cv_v)
+                    and pred_cv_v <= float(agent.cv_low_threshold)
+                )
+                if cv_ok:
                     try:
-                        ir_used = float(ir_norm)
+                        ir_norm_v = float(dbg.get("ir_norm", None))
+                        ir_low_v = float(dbg.get("ir_low", None))
+                        ir_high_v = float(dbg.get("ir_high", None))
                     except (TypeError, ValueError):
-                        ir_used = None
-                if ir_used is not None:
-                    p_min = max(
-                        1,
-                        int(
-                            round(
-                                base_num_particles
-                                * float(getattr(agent, "particles_min_frac", 0.25))
-                            )
-                        ),
-                    )
-                    ir_low = float(getattr(agent, "ir_particles_low", 0.35))
-                    ir_high = float(getattr(agent, "ir_particles_high", 1.5))
-                    if ir_high > ir_low:
-                        t = (float(ir_used) - ir_low) / (ir_high - ir_low)
-                    else:
-                        t = 1.0
-                    t = max(0.0, min(1.0, t))
-                    ir_t = float(t)
-                    particles = int(round(p_min + t * (base_num_particles - p_min)))
-                    particles = max(p_min, min(base_num_particles, particles))
+                        ir_norm_v = None
+                        ir_low_v = None
+                        ir_high_v = None
+                    if (
+                        ir_norm_v is not None
+                        and ir_low_v is not None
+                        and ir_high_v is not None
+                        and math.isfinite(ir_norm_v)
+                        and math.isfinite(ir_low_v)
+                        and math.isfinite(ir_high_v)
+                        and (ir_high_v > ir_low_v)
+                        and (ir_norm_v <= ir_low_v)
+                    ):
+                        p_min = max(
+                            1,
+                            int(
+                                round(
+                                    base_num_particles
+                                    * float(agent.particles_min_frac)
+                                )
+                            ),
+                        )
+                        particles = min(base_num_particles, p_min)
+                        stable_unimodal = True
         agent._last_eval_particles = int(particles)
 
         # ---- risk + multi-fidelity knobs ----
-        risk_coef = float(getattr(agent, "risk_spread_coef", 0.0))
-        two_stage = bool(getattr(agent, "two_stage_eval", False))
-        stage1_frac = float(getattr(agent, "two_stage_particles_frac", 0.25))
-        topk_frac = float(getattr(agent, "two_stage_topk_frac", 0.2))
-        max_topk = int(getattr(agent, "two_stage_max_topk", 64))
+        risk_coef = float(agent.risk_spread_coef)
+        two_stage = bool(agent.two_stage_eval)
+        stage1_frac = float(agent.two_stage_particles_frac)
+        topk_frac = float(agent.two_stage_topk_frac)
+        max_topk = int(agent.two_stage_max_topk)
 
-        # Optionally tighten two-stage evaluation when IR indicates a stable/unimodal regime.
-        # This only kicks in for optimizers that populate ``ir_norm`` (e.g., BCCEM).
-        if ir_t is not None:
-            scale = 0.5 + 0.5 * ir_t  # unimodal -> 0.5x, multimodal -> 1.0x
-            stage1_frac = max(0.1, min(1.0, stage1_frac * scale))
-            topk_frac = max(0.05, min(1.0, topk_frac * scale))
+        if stable_unimodal:
+            stage1_frac = max(0.1, min(1.0, stage1_frac * 0.5))
+            topk_frac = max(0.05, min(1.0, topk_frac * 0.5))
 
         need_var = (risk_coef > 0.0) and supports_return_variance
 

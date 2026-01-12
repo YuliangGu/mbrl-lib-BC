@@ -17,3 +17,4 @@ from .trajectory_opt import (
     TrajectoryOptimizerAgent,
     create_trajectory_optim_agent_for_model,
 )
+from .poplin_agent import PoplinTrajectoryOptimizerAgent

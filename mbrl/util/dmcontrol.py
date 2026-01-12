@@ -2,13 +2,50 @@
 #
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
-from typing import Tuple
+from typing import Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
 
 import mbrl.third_party.dmc2gym as dmc2gym
 from mbrl.util.env import EnvHandler, Freeze
+
+
+def make_dmcontrol_env(
+    *,
+    domain_name: str,
+    task_name: str,
+    seed: Optional[int] = None,
+    visualize_reward: bool = False,
+    from_pixels: bool = False,
+    height: int = 84,
+    width: int = 84,
+    camera_id: int = 0,
+    frame_skip: int = 1,
+    episode_length: int = 1000,
+    environment_kwargs: Optional[dict] = None,
+    time_limit: Optional[int] = None,
+    channels_first: bool = True,
+    bit_depth: int = 8,
+) -> gym.Env:
+    """Creates a dm_control environment (via dmc2gym) wrapped as a Gymnasium env."""
+    env = dmc2gym.make(
+        domain_name=domain_name,
+        task_name=task_name,
+        seed=seed if seed is not None else 1,
+        visualize_reward=visualize_reward,
+        from_pixels=from_pixels,
+        height=height,
+        width=width,
+        camera_id=camera_id,
+        frame_skip=frame_skip,
+        episode_length=episode_length,
+        environment_kwargs=environment_kwargs,
+        time_limit=time_limit,
+        channels_first=channels_first,
+        bit_depth=bit_depth,
+    )
+    return gym.make("GymV26Environment-v0", env=env)
 
 
 def _is_dmcontrol_gym_env(env: gym.wrappers.TimeLimit) -> bool:

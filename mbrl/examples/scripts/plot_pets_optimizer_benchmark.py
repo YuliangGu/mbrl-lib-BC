@@ -62,14 +62,23 @@ _RESULT_FIELDS = (
     "planning_skips_per_step",
     "planning_centroid_frac",
     "planning_ir_norm_mean",
+    "planning_ir_norm_mean_ema",
+    "planning_ir_low_mean",
+    "planning_ir_high_mean",
+    "planning_pred_return_cv_mean",
     "planning_ir_norm_min",
     "planning_ir_norm_max",
+    # POPLIN (policy distillation) losses; present only for POPLIN runs.
+    "poplin_policy_loss_total",
+    "poplin_policy_loss_action",
+    "poplin_policy_loss_weights",
 )
 
 
 @dataclass(frozen=True)
 class ResultSpec:
     env: str
+    variant: Optional[str]
     optimizer: str
     seed: int
     path: Path
@@ -244,12 +253,18 @@ def _load_summary_specs(run_dir: Path) -> List[ResultSpec]:
     specs: List[ResultSpec] = []
     for row in rows:
         env = row.get("env")
+        variant = row.get("variant") or None
         optimizer = row.get("optimizer")
         seed = _parse_int(row.get("seed"))
         if not env or not optimizer or seed is None:
             continue
-        path = run_dir / env / optimizer / f"seed{seed}" / "results.csv"
-        specs.append(ResultSpec(env=env, optimizer=optimizer, seed=seed, path=path))
+        if variant:
+            path = run_dir / env / variant / optimizer / f"seed{seed}" / "results.csv"
+        else:
+            path = run_dir / env / optimizer / f"seed{seed}" / "results.csv"
+        specs.append(
+            ResultSpec(env=env, variant=variant, optimizer=optimizer, seed=seed, path=path)
+        )
     return specs
 
 
@@ -261,15 +276,21 @@ def _scan_results_specs(run_dir: Path) -> List[ResultSpec]:
         except ValueError:
             continue
         parts = rel.parts
-        if len(parts) != 4:
+        if len(parts) == 4:
+            env, optimizer, seed_part, _ = parts
+            variant = None
+        elif len(parts) == 5:
+            env, variant, optimizer, seed_part, _ = parts
+        else:
             continue
-        env, optimizer, seed_part, _ = parts
         if not seed_part.startswith("seed"):
             continue
         seed = _parse_int(seed_part[len("seed") :])
         if seed is None:
             continue
-        specs.append(ResultSpec(env=env, optimizer=optimizer, seed=seed, path=path))
+        specs.append(
+            ResultSpec(env=env, variant=variant, optimizer=optimizer, seed=seed, path=path)
+        )
     return specs
 
 
@@ -277,12 +298,15 @@ def _filter_specs(
     specs: Iterable[ResultSpec],
     *,
     env: Optional[str],
+    variant: Optional[str],
     optimizers: Optional[Sequence[str]],
     seeds: Optional[Sequence[int]],
 ) -> List[ResultSpec]:
     out: List[ResultSpec] = []
     for spec in specs:
         if env is not None and spec.env != env:
+            continue
+        if variant is not None and (spec.variant or "") != variant:
             continue
         if optimizers is not None and spec.optimizer not in optimizers:
             continue
@@ -307,13 +331,13 @@ def _load_results_series(path: Path) -> Dict[str, np.ndarray]:
 
 def _group_by_env_and_optimizer(
     specs: Sequence[ResultSpec], x_key: str
-) -> Dict[Tuple[str, str], List[Dict[str, np.ndarray]]]:
-    grouped: Dict[Tuple[str, str], List[Dict[str, np.ndarray]]] = {}
+) -> Dict[Tuple[str, str, str], List[Dict[str, np.ndarray]]]:
+    grouped: Dict[Tuple[str, str, str], List[Dict[str, np.ndarray]]] = {}
     for spec in specs:
         data = _load_results_series(spec.path)
         if not data or x_key not in data:
             continue
-        grouped.setdefault((spec.env, spec.optimizer), []).append(data)
+        grouped.setdefault((spec.env, spec.variant or "", spec.optimizer), []).append(data)
     return grouped
 
 
@@ -498,8 +522,9 @@ def _plot_env(
     *,
     run_dir: Path,
     env: str,
+    variant: str,
     optimizers: Sequence[str],
-    grouped: Dict[Tuple[str, str], List[Dict[str, np.ndarray]]],
+    grouped: Dict[Tuple[str, str, str], List[Dict[str, np.ndarray]]],
     x_key: str,
     smooth: int,
     show_seeds: bool,
@@ -509,7 +534,7 @@ def _plot_env(
 ) -> None:
     import matplotlib.ticker as mticker
 
-    present_opts = [opt for opt in optimizers if grouped.get((env, opt))]
+    present_opts = [opt for opt in optimizers if grouped.get((env, variant, opt))]
     if not present_opts:
         return
 
@@ -538,7 +563,7 @@ def _plot_env(
     ax_replans = fig.add_subplot(gs[1, 3], sharex=ax_reward)
     ax_reward.tick_params(labelbottom=False)
 
-    cem_baseline = grouped.get((env, "cem"), [])
+    cem_baseline = grouped.get((env, variant, "cem"), [])
     baseline_x, baseline_y = _mean_curve(cem_baseline, x_key, "planning_time_ms")
     baseline_y_s = _smooth_nanmean(baseline_y, smooth)
     have_baseline = baseline_x.size > 0 and baseline_y_s.size > 0
@@ -547,7 +572,7 @@ def _plot_env(
 
     norm_for_ylim: List[np.ndarray] = []
     for opt in present_opts:
-        series_list = grouped[(env, opt)]
+        series_list = grouped[(env, variant, opt)]
         color = color_map[opt]
         label = _opt_label(opt)
 
@@ -638,8 +663,8 @@ def _plot_env(
             vals = np.concatenate(finite, axis=0)
             dev = float(np.nanpercentile(np.abs(vals - 1.0), 95))
             dev = max(dev, 0.05)
-            pad = 1.25
-            ax_time_norm.set_ylim(0.2, 1.1)
+            pad = 2.5
+            ax_time_norm.set_ylim(1.0 - pad * dev, 1.0 + pad * dev)
     if not have_baseline:
         ax_time_norm.text(
             0.5,
@@ -676,22 +701,40 @@ def _plot_env(
             ncol=min(6, len(labels)),
             frameon=False,
         )
-    fig.suptitle(f"{env} \u2014 {run_dir.name}")
+    env_title = env if not variant else f"{env} (variant={variant})"
+    fig.suptitle(f"{env_title} \u2014 {run_dir.name}")
     fig.subplots_adjust(top=0.86)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{run_dir.name}_{env}_training.png"
+    variant_suffix = f"_{variant}" if variant else ""
+    out_path = out_dir / f"{run_dir.name}_{env}{variant_suffix}_training.png"
     fig.savefig(out_path, dpi=180)
     print(f"[saved] {out_path}")
     if show:
         plt.show()
     plt.close(fig)
 
-    if "bccem" in optimizers and grouped.get((env, "bccem")):
+    _plot_poplin_policy_loss(
+        run_dir=run_dir,
+        env=env,
+        variant=variant,
+        present_opts=present_opts,
+        grouped=grouped,
+        x_key=x_key,
+        smooth=smooth,
+        show_seeds=show_seeds,
+        out_dir=out_dir,
+        show=show,
+        plt=plt,
+        color_map=color_map,
+    )
+
+    if "bccem" in optimizers and grouped.get((env, variant, "bccem")):
         _plot_bccem_diagnostics(
             run_dir=run_dir,
             env=env,
-            series_list=grouped[(env, "bccem")],
+            variant=variant,
+            series_list=grouped[(env, variant, "bccem")],
             x_key=x_key,
             smooth=smooth,
             show_seeds=show_seeds,
@@ -701,10 +744,132 @@ def _plot_env(
         )
 
 
+def _plot_poplin_policy_loss(
+    *,
+    run_dir: Path,
+    env: str,
+    variant: str,
+    present_opts: Sequence[str],
+    grouped: Dict[Tuple[str, str, str], List[Dict[str, np.ndarray]]],
+    x_key: str,
+    smooth: int,
+    show_seeds: bool,
+    out_dir: Path,
+    show: bool,
+    plt,
+    color_map: Dict[str, object],
+) -> None:
+    import matplotlib.ticker as mticker
+
+    loss_keys = (
+        "poplin_policy_loss_total",
+        "poplin_policy_loss_action",
+        "poplin_policy_loss_weights",
+    )
+    have_any = False
+    for opt in present_opts:
+        series_list = grouped.get((env, variant, opt), [])
+        for key in loss_keys:
+            for s in series_list:
+                y = s.get(key)
+                if y is None:
+                    continue
+                if np.any(np.isfinite(np.asarray(y, dtype=float))):
+                    have_any = True
+                    break
+            if have_any:
+                break
+        if have_any:
+            break
+    if not have_any:
+        return
+
+    fig, (ax_total, ax_action, ax_weights) = plt.subplots(1, 3, figsize=(14, 4), sharex=True)
+    for opt in present_opts:
+        series_list = grouped.get((env, variant, opt), [])
+        if not series_list:
+            continue
+        color = color_map.get(opt)
+        if color is None:
+            color = plt.get_cmap("tab10")(0)
+        _plot_with_optional_mean(
+            ax_total,
+            series_list=series_list,
+            x_key=x_key,
+            y_key="poplin_policy_loss_total",
+            label=_opt_label(opt),
+            color=color,
+            smooth=smooth,
+            show_seeds=show_seeds,
+        )
+        _plot_with_optional_mean(
+            ax_action,
+            series_list=series_list,
+            x_key=x_key,
+            y_key="poplin_policy_loss_action",
+            label=None,
+            color=color,
+            smooth=smooth,
+            show_seeds=show_seeds,
+        )
+        _plot_with_optional_mean(
+            ax_weights,
+            series_list=series_list,
+            x_key=x_key,
+            y_key="poplin_policy_loss_weights",
+            label=None,
+            color=color,
+            smooth=smooth,
+            show_seeds=show_seeds,
+        )
+
+    x_label = "Env steps" if x_key == "env_step" else "Episode"
+    if x_key == "env_step":
+        formatter = mticker.FuncFormatter(lambda x, _pos: _human_format(x))
+        for ax in (ax_total, ax_action, ax_weights):
+            ax.xaxis.set_major_formatter(formatter)
+    else:
+        for ax in (ax_total, ax_action, ax_weights):
+            ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+
+    ax_total.set_title("POPLIN: Policy Loss (total)")
+    ax_total.set_ylabel("loss")
+    ax_action.set_title("POPLIN: Action Loss")
+    ax_weights.set_title("POPLIN: Weights Loss")
+    for ax in (ax_total, ax_action, ax_weights):
+        ax.set_xlabel(x_label)
+        ax.set_axisbelow(True)
+        ax.grid(True, which="major", alpha=0.25)
+
+    handles, labels = ax_total.get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            ncol=min(6, len(labels)),
+            frameon=False,
+        )
+
+    env_title = env if not variant else f"{env} (variant={variant})"
+    fig.suptitle(f"{env_title} \u2014 {run_dir.name} \u2014 policy loss")
+    fig.subplots_adjust(top=0.82, bottom=0.22, wspace=0.28)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    variant_suffix = f"_{variant}" if variant else ""
+    out_path = out_dir / f"{run_dir.name}_{env}{variant_suffix}_poplin_policy_loss.png"
+    fig.savefig(out_path, dpi=160)
+    print(f"[saved] {out_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 def _plot_bccem_diagnostics(
     *,
     run_dir: Path,
     env: str,
+    variant: str,
     series_list: Sequence[Dict[str, np.ndarray]],
     x_key: str,
     smooth: int,
@@ -716,7 +881,7 @@ def _plot_bccem_diagnostics(
     import matplotlib.ticker as mticker
 
     cmap = plt.get_cmap("tab10")
-    fig, (ax_mode, ax_ir) = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+    fig, (ax_mode, ax_ir, ax_cv) = plt.subplots(1, 3, figsize=(14, 4), sharex=True)
 
     _plot_with_optional_mean(
         ax_mode,
@@ -761,6 +926,47 @@ def _plot_bccem_diagnostics(
         smooth=smooth,
         show_seeds=show_seeds,
     )
+    _plot_with_optional_mean(
+        ax_ir,
+        series_list=series_list,
+        x_key=x_key,
+        y_key="planning_ir_norm_mean_ema",
+        label="IR norm EMA",
+        color=cmap(4),
+        smooth=smooth,
+        show_seeds=show_seeds,
+        linestyle="--",
+    )
+    _fill_between_mean_range(
+        ax_ir,
+        series_list=series_list,
+        x_key=x_key,
+        y_min_key="planning_ir_low_mean",
+        y_max_key="planning_ir_high_mean",
+        color="gray",
+        smooth=smooth,
+        alpha=0.12,
+    )
+    x_low, y_low = _mean_curve(series_list, x_key=x_key, y_key="planning_ir_low_mean")
+    x_high, y_high = _mean_curve(series_list, x_key=x_key, y_key="planning_ir_high_mean")
+    if x_low.size and y_low.size:
+        ax_ir.plot(
+            x_low,
+            _smooth_nanmean(y_low, smooth),
+            color="gray",
+            linewidth=1.6,
+            linestyle=":",
+            label="IR band",
+        )
+    if x_high.size and y_high.size:
+        ax_ir.plot(
+            x_high,
+            _smooth_nanmean(y_high, smooth),
+            color="gray",
+            linewidth=1.6,
+            linestyle=":",
+            label="_nolegend_",
+        )
     _fill_between_mean_range(
         ax_ir,
         series_list=series_list,
@@ -772,13 +978,24 @@ def _plot_bccem_diagnostics(
         alpha=0.10,
     )
 
+    _plot_with_optional_mean(
+        ax_cv,
+        series_list=series_list,
+        x_key=x_key,
+        y_key="planning_pred_return_cv_mean",
+        label="pred return CV",
+        color=cmap(5),
+        smooth=smooth,
+        show_seeds=show_seeds,
+    )
+
     x_label = "Env steps" if x_key == "env_step" else "Episode"
     if x_key == "env_step":
         formatter = mticker.FuncFormatter(lambda x, _pos: _human_format(x))
-        for ax in (ax_mode, ax_ir):
+        for ax in (ax_mode, ax_ir, ax_cv):
             ax.xaxis.set_major_formatter(formatter)
     else:
-        for ax in (ax_mode, ax_ir):
+        for ax in (ax_mode, ax_ir, ax_cv):
             ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
 
     ax_mode.set_title("BCCEM: Execution Strategy")
@@ -792,15 +1009,22 @@ def _plot_bccem_diagnostics(
     ax_ir.set_xlabel(x_label)
     ax_ir.legend(loc="best", frameon=False)
 
-    for ax in (ax_mode, ax_ir):
+    ax_cv.set_title("BCCEM: Pred Return CV")
+    ax_cv.set_ylabel("cv")
+    ax_cv.set_xlabel(x_label)
+    ax_cv.legend(loc="best", frameon=False)
+
+    for ax in (ax_mode, ax_ir, ax_cv):
         ax.set_axisbelow(True)
         ax.grid(True, which="major", alpha=0.25)
 
-    fig.suptitle(f"{env} \u2014 {run_dir.name} \u2014 BCCEM diagnostics")
-    fig.subplots_adjust(top=0.82, wspace=0.28)
+    env_title = env if not variant else f"{env} (variant={variant})"
+    fig.suptitle(f"{env_title} \u2014 {run_dir.name} \u2014 BCCEM diagnostics")
+    fig.subplots_adjust(top=0.82, wspace=0.32)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{run_dir.name}_{env}_bccem.png"
+    variant_suffix = f"_{variant}" if variant else ""
+    out_path = out_dir / f"{run_dir.name}_{env}{variant_suffix}_bccem.png"
     fig.savefig(out_path, dpi=160)
     print(f"[saved] {out_path}")
     if show:
@@ -835,6 +1059,15 @@ def _parse_args() -> argparse.Namespace:
         help="Filter to a single env folder (e.g., pets_cartpole). Default: all envs found.",
     )
     parser.add_argument(
+        "--variant",
+        type=str,
+        default=None,
+        help=(
+            "Filter to a single POPLIN variant (e.g., 'a' or 'p'). "
+            "If omitted, plots all variants present."
+        ),
+    )
+    parser.add_argument(
         "-o",
         "--optimizers",
         nargs="+",
@@ -857,7 +1090,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--smooth",
         type=int,
-        default=2,
+        default=3,
         help="Moving-average window (in episodes). Use 1 to disable.",
     )
     parser.add_argument(
@@ -909,14 +1142,20 @@ def main() -> None:
     if not specs_all:
         specs_all = _scan_results_specs(run_dir)
     specs = _filter_specs(
-        specs_all, env=args.env, optimizers=args.optimizers, seeds=args.seeds
+        specs_all,
+        env=args.env,
+        variant=args.variant,
+        optimizers=args.optimizers,
+        seeds=args.seeds,
     )
     if not specs:
         envs_avail = sorted({s.env for s in specs_all})
+        variants_avail = sorted({s.variant or "" for s in specs_all})
         opts_avail = sorted({s.optimizer for s in specs_all})
         seeds_avail = sorted({s.seed for s in specs_all})
         avail_str = (
             f"Available envs: {envs_avail}\n"
+            f"Available variants: {variants_avail}\n"
             f"Available optimizers: {opts_avail}\n"
             f"Available seeds: {seeds_avail}"
             if specs_all
@@ -930,11 +1169,12 @@ def main() -> None:
 
     out_dir = Path(args.out).expanduser().resolve() if args.out else (run_dir / "plots")
     grouped = _group_by_env_and_optimizer(specs, args.x)
-    envs = sorted({spec.env for spec in specs})
-    for env in envs:
+    env_variant_pairs = sorted({(spec.env, spec.variant or "") for spec in specs})
+    for env, variant in env_variant_pairs:
         _plot_env(
             run_dir=run_dir,
             env=env,
+            variant=variant,
             optimizers=args.optimizers,
             grouped=grouped,
             x_key=args.x,

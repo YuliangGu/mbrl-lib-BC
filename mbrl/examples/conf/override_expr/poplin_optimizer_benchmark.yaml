@@ -1,37 +1,36 @@
 # @package _global_
-# Benchmark PETS with several trajectory optimizers under a shared planning budget.
+# Benchmark POPLIN (policy-augmented PETS) across trajectory optimizers under a shared budget.
 defaults:
-  - override /algorithm: pets
+  - override /algorithm: poplin
   - override /overrides: pets_cartpole
   - override /dynamics_model: gaussian_mlp_ensemble
   - override /action_optimizer: cem
   - _self_
 
-experiment: pets_optimizer_benchmark
+experiment: poplin_optimizer_benchmark
 
 overrides:
   # Fairness: use the same samples / iteration and iterations across optimizers.
-  # Use a budget divisible by both num_elites (default PETS uses 5) and worker count (4).
-  planning_samples_per_iter: 360
+  planning_samples_per_iter: 400
   planning_num_iters: 5
 
   # Base CEM settings used by all CEM-family variants.
-  cem_num_workers: 4                    
-  cem_population_size_per_worker: 90 # 4 * 90 = 360 total samples (the original 350 budget, but divisible by 5 elites).
+  cem_num_workers: 4
+  cem_population_size_per_worker: 100 
   cem_population_size: ${overrides.planning_samples_per_iter}
   cem_num_iters: ${overrides.planning_num_iters}
   cem_elite_ratio: 0.1
   cem_alpha: 0.1
   cem_clipped_normal: false
-  cem_init_jitter_scale: 0.3
+  cem_init_jitter_scale: 0.4
 
   # BCEM
-  cem_consensus_coef: 0.25
+  cem_consensus_coef: 0.15
   cem_consensus_anneal_power: 0.2
   cem_use_value_weights: false
   cem_ir_low: 0.05
   cem_ir_high: 0.5
-  cem_early_stop: true
+  cem_early_stop: false
   cem_early_stop_mu: 1e-3
   cem_early_stop_patience: 2
 
@@ -64,30 +63,53 @@ overrides:
   mppi_sigma: 1.0
   mppi_beta: 0.9
 
-# Trajectory optimizer agent knobs (merge into base PETS agent).
+# Trajectory optimizer agent knobs (merge into base POPLIN agent).
 algorithm:
+  # Make the experiment robust even if the algorithm config group isn't overridden
+  # (some Hydra setups may not apply nested defaults overrides from `+override_expr=...`).
+  name: "poplin"
   silent_model_train: true
   print_planning_info: true
-  num_particles: 20        
+  num_particles: 20
 
   agent:
+    _target_: mbrl.planning.PoplinTrajectoryOptimizerAgent
+    obs_dim: ???
     replan_freq: 1
     verbose: false
     keep_last_solution: true
 
-    # (NEW) two-stage evaluation settings
+    # (Optional) two-stage evaluation settings
     two_stage_eval: true
-    two_stage_particles_frac: 0.5 # fraction of particles for first stage
-    two_stage_topk_frac: 0.2      # fraction of topk to carry to second stage 
-    two_stage_max_topk: 64        # max topk to carry to second stage
+    two_stage_particles_frac: 0.5
+    two_stage_topk_frac: 0.2
+    two_stage_max_topk: 64
     risk_spread_coef: 0.0
 
     # adaptive particle settings for BC-CEM
     particle_schedule: "ir"
-    particles_min_frac: 0.25     # min fraction of base particles
+    particles_min_frac: 0.5
     cv_low_threshold: 0.1
 
-    # replan skipping informed by BC-CEM's IR estimates. 
+    # replan skipping informed by BC-CEM's IR estimates.
     skip_replan_if_ir_low: true
     skip_replan_ir_threshold: 0.1
     skip_replan_max_frac: 0.25
+
+    # POPLIN training defaults (override as needed).
+    poplin:
+      # POPLIN variant:
+      #   - "a": action-space warm-start + BC distillation (multi-head for multi-worker optimizers)
+      #   - "p": parameter-space planning (optimize policy params; AVG updates)
+      variant: a
+
+      warm_start_mode: auto
+      warm_start_mix: 1.0 
+
+      # Multi-worker distillation defaults: train each head against its paired worker.
+      action_loss_mode: uniform  # uniform / weighted
+      use_policy_weights: true
+      weight_loss_coef: 0.05
+
+      train_every: 1
+      updates_per_train: 2
